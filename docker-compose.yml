@@ -1,0 +1,36 @@
+version: '3.8'
+services:
+  redis:
+    image: redis:7
+    restart: unless-stopped
+
+  api:
+    build:
+      context: .
+      target: dev
+    environment:
+      - NODE_ENV=development
+    ports:
+      - "3000:3000"
+    depends_on:
+      - redis
+    volumes:
+      - ./:/usr/src/app:cached
+      - /usr/src/app/node_modules
+    command: pnpm run start:dev
+
+  worker:
+    build:
+      context: .
+      target: dev
+    command: node dist/worker.js
+    depends_on:
+      - redis
+    environment:
+      - NODE_ENV=development
+    volumes:
+      - ./:/usr/src/app:cached
+      - /usr/src/app/node_modules
+
+volumes:
+  node_modules: {}

@@ -1,0 +1,230 @@
+Task: Clean comic page and prepare it for motion-comic video usage.
+This is pixel restoration and structural cropping.
+This is NOT image generation.
+
+You are performing targeted inpainting + strict boundary cropping.
+
+Your job has TWO independent phases:
+
+PHASE 1 — dialogue removal
+PHASE 2 — mandatory hard boundary crop
+
+You MUST complete BOTH phases.
+
+PHASE 1 — REMOVE DIALOGUE ONLY
+
+Remove ONLY:
+
+• speech bubbles
+• dialogue balloons
+• thought bubbles
+• narration boxes
+• text inside those containers
+
+Delete the entire container AND the text.
+
+HARD PROTECTION RULE (critical)
+
+You are NOT allowed to modify or erase original artwork.
+
+Protect ALL original drawing:
+
+Characters
+face
+eyes
+mouth
+hair
+hands
+fingers
+skin
+clothes
+hair accessories
+
+Objects (highest protection):
+
+chains
+weapons
+scrolls
+books
+phones
+jewelry
+bed sheets touching body
+furniture touching body
+
+If a bubble overlaps:
+
+→ reconstruct hidden pixels
+→ NEVER remove body part or object
+
+Hands and held objects have absolute priority.
+
+SFX RULE
+
+SFX text is PART OF THE ARTWORK.
+
+Keep:
+
+轰 斩 砰
+impact words
+aura words
+large stylized calligraphy
+
+Never remove SFX.
+
+Only remove dialogue and narration.
+
+INPAINTING RULES
+
+Edit ONLY the bubble region.
+
+You must reconstruct:
+
+• background texture
+• aura glow
+• speed lines
+• clothing patterns
+• object edges
+
+Forbidden:
+
+blur patches
+white patches
+broken lines
+missing fingers
+damaged objects
+
+PHASE 2 — HARD BOUNDARY CROP (VERY IMPORTANT)
+
+This phase is NOT optional.
+
+After cleaning dialogue, you MUST crop the image.
+
+You are NOT cropping panels.
+
+You are cropping empty margin.
+
+CRITICAL: HOW TO DETECT THE TRUE ARTWORK AREA
+
+You MUST ignore visual meaning and use STRUCTURAL evidence.
+
+An area belongs to artwork ONLY if it contains:
+
+• ink outlines
+• drawing strokes
+• contour lines
+• object edge lines
+• shadow edges attached to objects or characters
+
+This is a pixel structure rule, not a scene understanding rule.
+
+Color, gradient, fog, or brightness DO NOT count.
+
+WHAT IS MARGIN (IMPORTANT)
+
+The following are ALWAYS margin:
+
+• flat white space
+• gradient sky with no outlines
+• empty gray area
+• watermark zones
+• compression noise
+• blank webtoon padding
+
+Even if it looks like background.
+
+If no ink outline exists → it is margin.
+
+OPEN WEBTOON RULE (THIS FIXES YOUR ISSUE)
+
+Many webtoon panels have NO bottom border.
+
+In this case:
+
+The artwork ends at the last pixel row containing any ink outline or shadow edge connected to an object or character.
+
+Everything below that row MUST be deleted.
+
+This is mandatory.
+
+EXACT CROPPING ALGORITHM (FOLLOW STRICTLY)
+
+You must scan image edges.
+
+Bottom boundary (most important)
+
+Starting from the bottom of the image:
+
+Move upward pixel row by pixel row.
+
+Find the FIRST row that contains ANY drawing stroke or outline pixel.
+
+That row is the TRUE artwork boundary.
+
+Delete every pixel below it.
+
+You are NOT allowed to keep extra padding.
+
+Top boundary
+
+From the top of the image:
+
+Move downward until a drawing outline appears.
+
+Crop everything above it.
+
+Left and Right
+
+From both sides:
+
+Move inward until an outline or object edge appears.
+
+Crop outside area.
+
+Safety padding
+
+After boundary detection:
+
+Add only 6 pixels padding.
+
+No more.
+
+Keeping large margins is an error.
+
+STRICT FAILURE CONDITION
+
+If large blank space remains at top or bottom, the task is considered failed.
+
+You must trim tightly.
+
+STYLE PRESERVATION
+
+Do NOT:
+
+enhance
+denoise
+sharpen
+repaint
+color-correct
+change lighting
+make realistic
+
+Preserve original comic style 100%.
+
+IMAGE SETTINGS
+
+• Keep original resolution quality
+• No resizing
+• Only crop
+• No filters
+
+OUTPUT
+
+Return ONLY the cleaned and tightly cropped image.
+
+No captions
+No explanation
+No extra text
+
+PERSISTENCE
+
+Apply these rules automatically to all future images.

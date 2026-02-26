@@ -1,0 +1,36 @@
+node_modules
+dist
+.env
+.env.local
+.env.*.local
+.cache
+config/cookies.json
+.DS_Store
+npm-debug.log
+pnpm-lock.yaml
+
+# Local runtime data and job outputs
+/data
+logs
+*.log
+
+# IDE/editor
+.vscode/
+.idea/
+*.sublime-workspace
+*.sublime-project
+
+# Docker / compose overrides
+docker-compose.override.yml
+docker-compose.*.local.yml
+
+# Misc
+coverage/
+.tmp/
+yarn.lock
+package-lock.json
+
+# pnpm caches and runtime files
+.pnpm-store/
+.pnpm-debug.log
+.pnpm/
