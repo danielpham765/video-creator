@@ -1,0 +1,185 @@
+# Parallel segmented downloads – improved plan
+
+## Goal
+
+Enable downloading a single video using many workers by splitting the work into independent parts, downloading in parallel, then combining into a final playable file.
+
+## 1. Segmentation strategy (size vs duration)
+
+### DASH/HLS (preferred path)
+
+- **Primary rule**: treat each *manifest segment* as the smallest atomic unit, then **group segments by approximate byte size** into larger “parts” to balance work across workers.
+- **Why**:
+  - Manifests already define safe boundaries (duration-based segments); reusing them avoids boundary/container corruption.
+  - Duration alone is a poor proxy for load-balancing (bitrate varies). Targeting **bytes** makes parts more even.
+- **How**:
+  - Build a segment list:
+    - `segmentIndex`, `url`, `durationSec`, `approxBytes`
+    - `approxBytes` from `content-length` (HEAD) when possible (or metadata when available).
+  - Choose `targetPartSizeBytes` (initial default: **8–32 MB**).
+  - Fold segments into parts until sum(approxBytes) reaches target.
+  - Persist a manifest where each part includes:
+    - `partIndex`, `segmentIndexes[]`, `expectedBytes`, `state`, `downloadedBytes`
+  - Each part becomes a subjob in `download-parts`.
+
+### HTTP byte-range split (fallback path)
+
+- **Rule**: when no segment manifest is available, split by **byte ranges only**.
+- **Why**: only total size and `Accept-Ranges` are known; duration is unreliable for splitting.
+- **How**:
+  - HEAD/initial request to get `content-length` and confirm `Accept-Ranges: bytes`.
+  - Choose `targetPartSizeBytes` (e.g. **8–16 MB**) or an explicit `partCount`.
+  - Compute contiguous ranges `[start, end]` covering the full object.
+  - Each range is a part-subjob with `expectedBytes = end - start + 1`.
+
+## 2. Progress and metrics (bytes-first)
+
+### Per-part accounting
+
+- Maintain in Redis a structure like `job:parts:<jobId>` (hash or JSON) containing, for each part:
+  - `expectedBytes`
+  - `downloadedBytes`
+  - `state` (`pending` | `active` | `completed` | `failed` | `cancelled`)
+- Each part-worker updates `downloadedBytes` periodically by either:
+  - Counting streamed bytes (recommended: extend `resumeDownload()` to accept an `onProgress(bytesDelta)` callback), or
+  - Polling partial file sizes on disk and writing them back to Redis (simpler, less accurate).
+
+### Total job progress
+
+- Precompute:
+  - `totalExpectedBytes = sum(parts.expectedBytes)`
+- Compute:
+  - `totalDownloadedBytes = sum(parts.downloadedBytes)`
+  - `percent = (totalDownloadedBytes / totalExpectedBytes) * 100` (bounded to [0, 100])
+- Status endpoint can expose:
+  - `totalBytes`, `downloadedBytes`, `percent`
+  - `partsCompleted`, `partsTotal`
+
+### Duration-based view (optional, derived)
+
+- For DASH/HLS only:
+  - `totalDurationSec = sum(segments.durationSec)`
+  - `downloadedDurationSec = sum(durations of segments belonging to completed parts)`
+- Expose as secondary UI metrics only (do not drive control logic).
+
+## 3. Master job location (API vs worker)
+
+- **Decision**: the **master/orchestrator runs in a worker**, not inside the API request.
+- **Rationale**:
+  - The API should stay short-lived: accept request, enqueue one top-level job, serve status/history.
+  - The master job does network I/O, computes segmentation, creates subjobs, monitors completion, retries, and may run longer—this matches the worker runtime.
+
+## 4. Orchestration design (master + part jobs + merge)
+
+1. **Master job** (Bull job in `downloads`) determines strategy and builds a parts manifest.
+2. Master creates N **part subjobs** in queue `download-parts` with metadata:
+   - `{ jobId, partIndex, url|range, expectedBytes, segmentIndexes? }`
+3. Workers pick part subjobs and download to:
+   - `data/<jobId>/parts/<index>.part` (or per-segment files if desired)
+   - On success, rename to `.complete`.
+4. Track part statuses in Redis under `job:parts:<jobId>`.
+5. When all parts complete, enqueue a **merge job** (or merge inline in master) and then finalize output location.
+
+## 5. High-level orchestration flow
+
+```mermaid
+flowchart TD
+  client[Client] --> apiPost["POST /download"]
+  apiPost --> downloadsQueue[downloadsQueue]
+  downloadsQueue --> masterJob[masterJob_orchestrator]
+  masterJob --> segmentation["buildPartsManifest"]
+  segmentation --> partsQueue[downloadPartsQueue]
+  partsQueue --> partWorker1[partWorker]
+  partsQueue --> partWorker2[partWorker]
+  partsQueue --> partWorkerN[partWorker]
+  partWorker1 --> progressRedis["Redis job:parts:<jobId>"]
+  partWorker2 --> progressRedis
+  partWorkerN --> progressRedis
+  progressRedis --> masterJob
+  masterJob --> mergeJob[mergeJob]
+  mergeJob --> finalFile["data/bilibili/<title>/<bvid>-<jobId>.mp4"]
+  masterJob --> statusApi["GET /download/status/:id"]
+  statusApi --> client
+```
+
+## 6. Final output location (post-merge)
+
+After merging into a playable video, move the result into:
+
+- `/data/bilibili/<video-title>/<video-id>-<job-id>.mp4`
+
+For Bilibili:
+- **video-id** is `bvid` (e.g. `BV...`)
+
+Notes:
+- `<video-title>` must be sanitized for filesystem safety (remove `/\\:*?"<>|`, trim, collapse whitespace, limit length).
+- Keep all intermediate artifacts under `data/<jobId>/...` and only move/rename the final file at the end.
+
+How to obtain `<video-title>`:
+- Call Bilibili view API once in the master job and persist it in the manifest:
+  - `GET https://api.bilibili.com/x/web-interface/view?bvid=<bvid>`
+
+## 7. Partial merge when master job is stopped/failed
+
+When a master job is stopped/failed, we can still attempt a **best-effort** merge into a watchable video.
+
+- **Default policy**: merge only a **contiguous prefix from the start** (no gaps). This is the safest approach to maximize playability.
+
+Rules:
+- **Segments strategy (DASH/HLS)**:
+  - Merge segments `0..k` where every segment is present and verified (`.complete`).
+  - Stop at the first missing segment.
+- **Byte-range strategy**:
+  - Merge only if parts cover `[0..X]` with no gaps.
+  - Output is a byte-prefix; container playability varies, but prefix-only is safest.
+
+### New API: merge partial parts
+
+- `POST /download/:id/merge-partial`
+  - Reads `data/<jobId>/manifest.json` (and/or Redis `job:parts:<jobId>`).
+  - Computes the largest contiguous prefix of completed parts/segments.
+  - Merges that prefix only.
+  - Writes output to:
+    - `/data/bilibili/<video-title>/<video-id>-<job-id>-partial.mp4`
+  - Appends job history events like:
+    - `{ state: 'partial-merging', progress: <...> }`
+    - `{ state: 'partial-merged', progress: 100, result: { path, mergedBytes, totalBytes, percent } }`
+  - If prefix length is 0, return `422` and record `{ state: 'partial-merge-not-possible' }`.
+
+## 8. Resumability
+
+- Each part worker uses `resumeDownload()` (segment URL downloads or byte ranges).
+- Persist per-part progress and partial files; retry/resume by reusing Range or re-requesting segment URLs.
+
+## 9. Merging examples
+
+- DASH/HLS (segments):
+  - `ffmpeg -f concat -safe 0 -i parts.txt -c copy output.mp4` (for compatible segments)
+  - Or `MP4Box -cat ... -new out.mp4` depending on format
+- Byte-range (MP4):
+  - Prefer `MP4Box` for concatenation, or remux via `ffmpeg` (may require re-encoding)
+
+## 10. Integrity & verification
+
+- Compute checksums (SHA256/MD5) for each part and verify before merging.
+- After merge, run `ffprobe` to verify stream integrity (optional but recommended).
+
+## 11. Coordination & cancellation
+
+- Use Redis for coordination and control signals:
+  - `job:stop:<jobId>` (stop)
+  - `job:parts:<jobId>` (progress/parts state)
+- Workers should abort cooperatively by checking stop/cancel signals.
+
+## 12. Risks & limits
+
+- Source servers may throttle many connections—start with conservative concurrency.
+- Byte-range reassembly for MP4 is fragile—prefer segments.
+- Disk I/O and network concurrency increase—monitor resource usage.
+
+## Next steps (implementation milestones)
+
+1. Implement master orchestration for DASH (manifest → parts → merge) with a small default concurrency.
+2. Add Redis part-tracking + progress computation and expose it in `GET /download/status/:id`.
+3. Add partial-merge endpoint `POST /download/:id/merge-partial`.
+4. Optionally prototype byte-range fallback for cases with no manifest.
