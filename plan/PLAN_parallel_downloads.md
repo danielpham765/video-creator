@@ -1,4 +1,4 @@
-# Parallel segmented downloads – improved plan
+# Parallel segmented downloads plan
 
 ## Goal
 
@@ -16,7 +16,7 @@ Enable downloading a single video using many workers by splitting the work into 
   - Build a segment list:
     - `segmentIndex`, `url`, `durationSec`, `approxBytes`
     - `approxBytes` from `content-length` (HEAD) when possible (or metadata when available).
-  - Choose `targetPartSizeBytes` (initial default: **8–32 MB**).
+  - Choose `targetPartSizeBytes` (default: **8 MB**).
   - Fold segments into parts until sum(approxBytes) reaches target.
   - Persist a manifest where each part includes:
     - `partIndex`, `segmentIndexes[]`, `expectedBytes`, `state`, `downloadedBytes`
@@ -28,7 +28,7 @@ Enable downloading a single video using many workers by splitting the work into 
 - **Why**: only total size and `Accept-Ranges` are known; duration is unreliable for splitting.
 - **How**:
   - HEAD/initial request to get `content-length` and confirm `Accept-Ranges: bytes`.
-  - Choose `targetPartSizeBytes` (e.g. **8–16 MB**) or an explicit `partCount`.
+  - Choose `targetPartSizeBytes` (default **8 MB**) or an explicit `partCount`.
   - Compute contiguous ranges `[start, end]` covering the full object.
   - Each range is a part-subjob with `expectedBytes = end - start + 1`.
 
@@ -85,28 +85,50 @@ Enable downloading a single video using many workers by splitting the work into 
 ```mermaid
 flowchart TD
   client[Client] --> apiPost["POST /download"]
-  apiPost --> downloadsQueue[downloadsQueue]
+  apiPost --> downloadsQueue[downloads queue]
   downloadsQueue --> masterJob[masterJob_orchestrator]
-  masterJob --> segmentation["buildPartsManifest"]
-  segmentation --> partsQueue[downloadPartsQueue]
+  masterJob --> segmentation["Build parts manifest"]
+  segmentation --> partsQueue[download-parts queue]
   partsQueue --> partWorker1[partWorker]
   partsQueue --> partWorker2[partWorker]
   partsQueue --> partWorkerN[partWorker]
-  partWorker1 --> progressRedis["Redis job:parts:<jobId>"]
+  partWorker1 --> progressRedis["Redis: job:parts:<jobId>"]
   partWorker2 --> progressRedis
   partWorkerN --> progressRedis
   progressRedis --> masterJob
   masterJob --> mergeJob[mergeJob]
-  mergeJob --> finalFile["data/bilibili/<title>/<bvid>-<jobId>.mp4"]
+  mergeJob --> finalFile["data/bilibili/<video-title>/<bvid>-<jobId>.mp4"]
   masterJob --> statusApi["GET /download/status/:id"]
   statusApi --> client
 ```
+
+## 5. How this maps to existing files
+
+- **Orchestrator (master job)**
+  - Extend or refactor `src/worker/worker.processor.ts` so that `handleJob` becomes the master orchestrator:
+    - If parallelizable: perform steps 1–4 above instead of the current single `resumeDownload` sequence.
+    - If not parallelizable or feature is disabled: keep existing behavior.
+- **Part workers**
+  - New Bull processor, e.g. `src/worker/parts.processor.ts`:
+    - `@Processor('download-parts')`.
+    - For each part:
+      - For DASH/HLS: loop over its assigned segment URLs and stream them to `data/<jobId>/parts/...` (using `resumeDownload`).
+      - For byte-range: use `Range` requests and stream into `part-<index>.bin`.
+      - Update `job:parts:<jobId>` in Redis with `downloadedBytes` and `state`.
+- **Merge job**
+  - Either:
+    - Implement as another step in the master job (after all parts complete), or
+    - Use a dedicated queue `download-merge` with a small processor that reads the manifest and writes the final `.mp4`.
+- **Status API changes**
+  - `GET /download/status/:id` (e.g. `src/download/download.controller.ts`) can be extended to read `job:parts:<jobId>` and expose:
+    - `totalBytes`, `downloadedBytes`, `percent`
+    - `partsCompleted`, `partsTotal`
 
 ## 6. Final output location (post-merge)
 
 After merging into a playable video, move the result into:
 
-- `/data/bilibili/<video-title>/<video-id>-<job-id>.mp4`
+- `data/bilibili/<video-title>/<video-id>-<job-id>.mp4`
 
 For Bilibili:
 - **video-id** is `bvid` (e.g. `BV...`)
@@ -136,11 +158,12 @@ Rules:
 ### New API: merge partial parts
 
 - `POST /download/:id/merge-partial`
+  - Only available / enabled when the master job is in a **failed** or **stopped** terminal state.
   - Reads `data/<jobId>/manifest.json` (and/or Redis `job:parts:<jobId>`).
   - Computes the largest contiguous prefix of completed parts/segments.
   - Merges that prefix only.
   - Writes output to:
-    - `/data/bilibili/<video-title>/<video-id>-<job-id>-partial.mp4`
+    - `data/bilibili/<video-title>/<video-id>-<job-id>-partial.mp4`
   - Appends job history events like:
     - `{ state: 'partial-merging', progress: <...> }`
     - `{ state: 'partial-merged', progress: 100, result: { path, mergedBytes, totalBytes, percent } }`
@@ -148,8 +171,25 @@ Rules:
 
 ## 8. Resumability
 
-- Each part worker uses `resumeDownload()` (segment URL downloads or byte ranges).
+- Each part worker uses `resumeDownload(onProgress)` (segment URL downloads or byte ranges).
+- `onProgress(bytesDelta)`:
+  - Updates `downloadedBytes` for the part in Redis.
+  - Is invoked frequently enough that the master/status poll (every 5s) sees fresh progress under normal network conditions.
 - Persist per-part progress and partial files; retry/resume by reusing Range or re-requesting segment URLs.
+
+### 8.1 Stall detection and job failure
+
+- The system polls job progress approximately every **5 seconds**.
+- For each download job:
+  - Track, per part (and/or segment file), whether its `downloadedBytes` has increased since the last poll.
+  - If **no growth** is observed for a given part for **3 consecutive polls** (~15s total) and the part is still `active`, treat this as a **stall**.
+- When a stall is detected:
+  - Mark the overall download job as **failed**.
+  - Include in the failure reason:
+    - Current aggregate progress (bytes/percent).
+    - Which part/segment stalled.
+    - Which worker was processing it (job id / worker id, as available).
+  - Coordinate with the master to stop the job and all of its sub-jobs.
 
 ## 9. Merging examples
 
@@ -169,7 +209,13 @@ Rules:
 - Use Redis for coordination and control signals:
   - `job:stop:<jobId>` (stop)
   - `job:parts:<jobId>` (progress/parts state)
-- Workers should abort cooperatively by checking stop/cancel signals.
+- Workers should abort cooperatively by checking stop/cancel signals:
+  - On `job:stop:<jobId>`:
+    - **Hard-stop immediately** by aborting the active HTTP stream / file write.
+    - Leave any partially written segment/part file on disk, but do **not** mark its part as `completed`.
+  - On the next `resumeDownload` for that job:
+    - Skip any unfinished segment/part files that were in-progress when the stop occurred.
+    - Continue from the next segment/byte-range according to the manifest.
 
 ## 12. Risks & limits
 
