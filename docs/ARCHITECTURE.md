@@ -1,15 +1,15 @@
 ## Video Creator API Architecture (AI Cache)
 
-Last updated: 2026-02-27
+Last updated: 2026-02-28
 Source of truth for Cursor, Codex, and Antigravity AI.
 
 ### 1) Purpose
 
 - Project: `video-creator` (NestJS + Bull + Redis + FFmpeg).
-- Primary goal: accept a Bilibili URL/BVID, download media in background jobs, and write final `.mp4` files under `data/`.
-- Persistence model:
+- Goal: accept Bilibili URL/BVID, run background downloads, and write final `.mp4` under `data/`.
+- Persistence:
   - Queue/job state in Bull + Redis.
-  - Durable local artifacts/history in filesystem (`data/`).
+  - Durable artifacts/history in filesystem (`data/`, `logs/`).
   - No relational database.
 
 ### 2) Runtime Topology
@@ -17,111 +17,120 @@ Source of truth for Cursor, Codex, and Antigravity AI.
 - API process:
   - Bootstrapped by [`src/main.ts`](/Users/danielpham/sync-workspace/05_Stories/video-creator/src/main.ts).
   - Loads dynamic [`AppModule.register()`](/Users/danielpham/sync-workspace/05_Stories/video-creator/src/app.module.ts).
-  - Exposes REST endpoints and Swagger (`/api`, `/docs`).
-  - Enqueues jobs to `downloads`.
-- Worker process:
-  - Enabled when `WORKER=true`.
+  - Exposes REST + Swagger (`/api`, `/docs`).
+  - Enqueues `downloads` jobs.
+- Worker process (`WORKER=true`):
   - Loads [`WorkerModule`](/Users/danielpham/sync-workspace/05_Stories/video-creator/src/worker/worker.module.ts).
   - Consumes `downloads` and `download-parts` queues.
 
 ### 3) Queue Model
 
 - Queue `downloads`:
-  - Orchestration job per requested download.
+  - Master/orchestration job per requested download.
   - Processor: [`WorkerProcessor`](/Users/danielpham/sync-workspace/05_Stories/video-creator/src/worker/worker.processor.ts).
 - Queue `download-parts`:
-  - Sub-jobs for byte-range or segmented part downloads.
+  - Sub-jobs for segmented/range part downloads.
   - Processor: [`PartsProcessor`](/Users/danielpham/sync-workspace/05_Stories/video-creator/src/worker/parts.processor.ts).
 
 ### 4) Request and Processing Flow
 
-1. Client calls `POST /download` with DTO `CreateDownloadDto` (`url` required, `title` optional).
-2. [`DownloadController.startDownload()`](/Users/danielpham/sync-workspace/05_Stories/video-creator/src/download/download.controller.ts) extracts `bvid` from URL (or accepts `payload.bvid` if present), then enqueues a `downloads` job.
-3. `WorkerProcessor` resolves `cid` and play URL via [`PlayurlService`](/Users/danielpham/sync-workspace/05_Stories/video-creator/src/playurl/playurl.service.ts).
-4. Worker chooses one strategy:
-   - `dash-segmented`: detect HLS/MPD segments and enqueue `download-parts` jobs.
-   - `dash-single`: download whole video/audio streams.
-   - `durl-byte-range`: split large single URL into byte-range parts and enqueue `download-parts`.
-   - direct fallback if splitting is not viable.
-5. Parts are merged (concat if needed), then audio+video are merged by [`FfmpegService`](/Users/danielpham/sync-workspace/05_Stories/video-creator/src/ffmpeg/ffmpeg.service.ts).
-6. Final output is moved to `data/bilibili/<safeTitle>/<bvid>-<jobId>.mp4`.
+1. Client calls `POST /download` with `CreateDownloadDto` (`url` required, `title` optional).
+2. [`DownloadController.startDownload()`](/Users/danielpham/sync-workspace/05_Stories/video-creator/src/download/download.controller.ts) extracts `bvid`, then enqueues a `downloads` job.
+3. Worker resolves `cid` and play URL via [`PlayurlService`](/Users/danielpham/sync-workspace/05_Stories/video-creator/src/playurl/playurl.service.ts).
+4. Worker selects strategy in this order:
+   - `dash-segmented`
+   - `durl-byte-range`
+   - `dash-single`
+   - `durl` (single file)
+5. Parts (if any) are merged, then video/audio merged by [`FfmpegService`](/Users/danielpham/sync-workspace/05_Stories/video-creator/src/ffmpeg/ffmpeg.service.ts).
+6. Final output: `data/bilibili/<safeTitle>/<bvid>-<jobId>.mp4`.
 7. History events are appended to `data/jobs/<jobId>.json`.
 
 ### 5) Public API (Current)
 
 - `POST /download`
-  - Body: `{ url: string, title?: string }` (validated via DTO).
-  - Response: `{ jobId }`.
+  - Body: `{ url: string, title?: string }`
+  - Response: `{ jobId }`
 - `GET /download/status/:id`
-  - Returns Bull job state/progress/failure/result + job history.
-  - Includes parts summary from Redis key `job:parts:<id>` when available.
+  - Returns job state/progress/failure/result/history + parts summary (from Redis hash `job:parts:<id>` when present).
 - `POST /download/:id/resume`
-  - Sends stop signal for active job and re-enqueues.
-  - Returns `{ status: 'resume-enqueued', newJobId }`.
+  - Sends stop signal and re-enqueues as a new job id.
 - `POST /download/:id/cancel`
-  - Sets cancel markers and best-effort removes queued job.
-  - Returns `{ status: 'cancelled', id }`.
+  - Sets cancel markers/signals and best-effort removes queued job.
 - `POST /download/:id/merge-partial`
-  - Partial merge helper for `durl-byte-range` manifests.
+  - Partial merge helper for byte-range manifests.
 
 ### 6) Control Signals and Coordination
 
 - Stop:
-  - Redis key/channel: `job:stop:<id>`.
-  - Filesystem fallback: `data/<id>.stop`.
+  - Redis key/channel: `job:stop:<id>`
+  - Filesystem fallback: `data/<id>.stop`
 - Cancel:
-  - Redis key/channel: `job:cancel:<id>`.
-  - Filesystem marker: `data/<id>.cancel`.
+  - Redis key/channel: `job:cancel:<id>`
+  - Filesystem marker: `data/<id>.cancel`
 - Part progress:
-  - Redis hash: `job:parts:<id>`.
-  - Fields like:
-    - `totalExpectedBytes`
-    - `part:<n>:state`, `part:<n>:expectedBytes`, `part:<n>:downloadedBytes`
-    - `part:audio:<n>:...` for audio parts
+  - Redis hash: `job:parts:<id>`
 
-### 7) Filesystem Layout
+### 7) Concurrency and Limits
+
+- Master jobs (`downloads`) per worker process:
+  - effective cap = `min(worker.concurrency, download.singleMaxConcurrentDownloads)`.
+- Part jobs (`download-parts`) per worker process:
+  - `download.parallelMaxConcurrentDownloads`.
+- Global single-download cap (across replicas):
+  - `download.globalSingleMaxConcurrentDownloads`
+  - semaphore key: `semaphore:downloads:single:global`.
+- Global part-download cap (across replicas):
+  - `download.globalParallelMaxConcurrentDownloads`
+  - semaphore key: `semaphore:downloads:parallel:global`.
+- Lease/wait tuning:
+  - `download.globalLimiterLeaseMs`
+  - `download.globalLimiterWaitMs`
+
+### 8) Filesystem Layout
 
 - `data/`
-  - `bilibili/<safeTitle>/<bvid>-<jobId>.mp4` (final outputs)
-  - `<jobId>.cancel`, `<jobId>.stop` (control markers)
-  - `<jobId>-video`, `<jobId>-audio` (temporary single-stream artifacts)
-  - `<jobId>/manifest.json` (strategy + part metadata)
+  - `bilibili/<safeTitle>/<bvid>-<jobId>.mp4`
+  - `<jobId>.cancel`, `<jobId>.stop`
+  - `<jobId>/manifest.json`
   - `<jobId>/parts/part-<i>.bin`, `audio-part-<i>.bin`
-  - `jobs/<jobId>.json` (append-only history events)
+  - `jobs/<jobId>.json`
+- `logs/`
+  - `api/app.*.log`
+  - `worker/<worker-label>/app.*.log`
+  - `worker/app.*.log` (aggregated)
+  - `archived/*.zip`
 
-### 8) Core Modules and Owners
+### 9) Logging and Rotation
 
-- API layer:
-  - [`src/download/download.module.ts`](/Users/danielpham/sync-workspace/05_Stories/video-creator/src/download/download.module.ts)
-  - [`src/download/download.controller.ts`](/Users/danielpham/sync-workspace/05_Stories/video-creator/src/download/download.controller.ts)
-  - [`src/download/download.service.ts`](/Users/danielpham/sync-workspace/05_Stories/video-creator/src/download/download.service.ts)
-- Worker layer:
-  - [`src/worker/worker.module.ts`](/Users/danielpham/sync-workspace/05_Stories/video-creator/src/worker/worker.module.ts)
-  - [`src/worker/worker.processor.ts`](/Users/danielpham/sync-workspace/05_Stories/video-creator/src/worker/worker.processor.ts)
-  - [`src/worker/parts.processor.ts`](/Users/danielpham/sync-workspace/05_Stories/video-creator/src/worker/parts.processor.ts)
-- Integrations/utilities:
-  - [`src/playurl/playurl.service.ts`](/Users/danielpham/sync-workspace/05_Stories/video-creator/src/playurl/playurl.service.ts)
-  - [`src/ffmpeg/ffmpeg.service.ts`](/Users/danielpham/sync-workspace/05_Stories/video-creator/src/ffmpeg/ffmpeg.service.ts)
-  - [`src/utils/resume-download.ts`](/Users/danielpham/sync-workspace/05_Stories/video-creator/src/utils/resume-download.ts)
-  - [`src/jobs/job-history.service.ts`](/Users/danielpham/sync-workspace/05_Stories/video-creator/src/jobs/job-history.service.ts)
+- Logger implementation: [`FileLoggerService`](/Users/danielpham/sync-workspace/05_Stories/video-creator/src/common/file-logger.service.ts).
+- Console prints only `info` logs.
+- File fanout:
+  - `app.info.log`: info + warn + error
+  - `app.warn.log`: warn + error
+  - `app.error.log`: error
+  - `app.debug.log`: debug + info + warn + error
+- Rotation:
+  - Trigger: any managed file exceeds size threshold.
+  - Action: zip all managed logs together, then truncate all.
+  - Archive name: `yyyy-mm-dd_hh-mm-ss.zip`.
+  - Destination: local (`logs/archived`) or S3.
 
-### 9) Configuration Source
+### 10) Configuration Source
 
-- Primary human-readable config: [`config/config.yaml`](/Users/danielpham/sync-workspace/05_Stories/video-creator/config/config.yaml).
-- Loaded via [`src/config/config.loader.ts`](/Users/danielpham/sync-workspace/05_Stories/video-creator/src/config/config.loader.ts).
-- Important keys:
-  - `redis.url`
-  - `download.dataDir`
-  - `download.partSizeBytes` (interpreted as MB in worker code)
-  - `download.retryCount`, `download.retryBackoffMs`
-  - `download.resumeEnabled`
-  - `ffmpeg.path`
-  - `proxy.http`, `proxy.https`
+- Human-readable config: [`config/config.yaml`](/Users/danielpham/sync-workspace/05_Stories/video-creator/config/config.yaml).
+- Loader: [`src/config/config.loader.ts`](/Users/danielpham/sync-workspace/05_Stories/video-creator/src/config/config.loader.ts).
+- Key sections:
+  - `redis.*`
+  - `worker.*`
+  - `download.*`
+  - `ffmpeg.*`
+  - `proxy.*`
+  - `logging.*`
 
-### 10) Known Invariants (for AI edits)
+### 11) Current Invariants
 
 - Queue names are fixed: `downloads`, `download-parts`.
-- Final output naming: `<bvid>-<jobId>.mp4`.
-- API can run without worker in-process; worker role is gated by `WORKER=true`.
-- `POST /download` currently requires `url` by DTO, even though controller also accepts prefilled `bvid` in payload internals.
-- `GET /download/status/:id` is the canonical status endpoint.
+- Final file naming stays `<bvid>-<jobId>.mp4` inside normalized title folder.
+- Cookies are read from `config/cookies.json` by worker.
+- `GET /download/status/:id` is canonical status endpoint.

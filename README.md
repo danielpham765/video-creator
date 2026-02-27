@@ -11,13 +11,13 @@ corepack enable
 # build and start dev containers
 docker compose up --build -d
 
-# view API logs
+# view logs (info)
 docker compose logs -f api
+docker compose logs -f worker
+
+# view logs (debug)
+make logs api
+make logs worker
+
 ```
 
-API endpoints:
-- `POST /download` { bvid | url, cookies }
-- `GET /status/:id`
-- `GET /result/:id`
-
-See `/plan/PLAN_nestjs.md` for detailed plan and dev notes.

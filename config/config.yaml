@@ -19,7 +19,7 @@ redis:
 
 worker:
   # ENV: WORKER_CONCURRENCY
-  concurrency: 4
+  concurrency: 2
   # ENV: BULL_QUEUE_PREFIX
   queuePrefix: ""
 
@@ -33,8 +33,32 @@ download:
   # Allowed: auto | dash-single | dash-segmented | durl-byte-range
   # ENV: DOWNLOAD_DEFAULT_STRATEGY
   defaultStrategy: auto
-  # Max concurrent part downloads per process (ENV: MAX_CONCURRENT_DOWNLOADS)
-  maxConcurrentDownloads: 10
+  # Per-process cap for parallel strategies:
+  # - dash-segmented
+  # - durl-byte-range
+  # ENV: PARALLEL_MAX_CONCURRENT_DOWNLOADS
+  parallelMaxConcurrentDownloads: 10
+  # Per-process cap for single-download strategies:
+  # - dash-single
+  # - durl single file
+  # ENV: SINGLE_MAX_CONCURRENT_DOWNLOADS
+  singleMaxConcurrentDownloads: 5
+  # Global cap across all worker replicas/processes for parallel strategies:
+  # - dash-segmented
+  # - durl-byte-range
+  # Set 0 to disable this limiter. (ENV: GLOBAL_PARALLEL_MAX_CONCURRENT_DOWNLOADS)
+  globalParallelMaxConcurrentDownloads: 10
+  # Global cap across all worker replicas/processes for single-download strategies:
+  # - dash-single
+  # - durl single file
+  # Set 0 to disable this limiter. (ENV: GLOBAL_SINGLE_MAX_CONCURRENT_DOWNLOADS)
+  globalSingleMaxConcurrentDownloads: 5
+  # Lease duration for global limiter permits in milliseconds.
+  # Expired permits are reclaimed automatically. (ENV: GLOBAL_LIMITER_LEASE_MS)
+  globalLimiterLeaseMs: 120000
+  # Wait interval before retrying global permit acquire in milliseconds.
+  # (ENV: GLOBAL_LIMITER_WAIT_MS)
+  globalLimiterWaitMs: 300
   # Retry attempts for transient failures (ENV: DOWNLOAD_RETRY_COUNT)
   retryCount: 3
   # Toggle resumable downloads on/off (ENV: RESUME_DOWNLOAD_ENABLED)
@@ -66,7 +90,7 @@ logging:
     destination: local
     local:
       # Local archive retention by max number of zip files (ENV: LOG_ROTATE_LOCAL_MAX_FILES)
-      maxFiles: 20
+      maxFiles: 10
       # Optional retention by days; 0 means disabled (ENV: LOG_ROTATE_LOCAL_RETENTION_DAYS)
       retentionDays: 0
     s3:

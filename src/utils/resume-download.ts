@@ -18,7 +18,7 @@ export async function resumeDownload(
   stopFileOrCheck?: string | StopCheckFn,
   onProgress?: ProgressCallback,
   computeMd5: boolean = false,
-  options?: { timeoutMs?: number; proxy?: string; logger?: { debug?: (...args: any[]) => void; log?: (...args: any[]) => void } },
+  options?: { timeoutMs?: number; stallTimeoutMs?: number; proxy?: string; logger?: { debug?: (...args: any[]) => void; log?: (...args: any[]) => void } },
 ): Promise<ResumeDownloadResult> {
   const start = fs.existsSync(dest) ? fs.statSync(dest).size : 0;
   const reqHeaders: Record<string, string> = Object.assign({}, headers || {});
@@ -70,9 +70,13 @@ export async function resumeDownload(
   const writer = fs.createWriteStream(dest, { flags: start > 0 ? 'a' : 'w' });
   let received = start;
   let lastLog = Date.now();
+  let lastChunkAt = Date.now();
   const hash = computeMd5 ? crypto.createHash('md5') : null;
+  const stallTimeoutMs = Math.max(timeout * 2, Number(options?.stallTimeoutMs ?? 120000));
+  let stallTimer: NodeJS.Timeout | null = null;
 
   response.data.on('data', (chunk: Buffer) => {
+    lastChunkAt = Date.now();
     received += chunk.length;
     if (hash) {
       try {
@@ -141,9 +145,23 @@ export async function resumeDownload(
   await new Promise<void>((resolve, reject) => {
     response.data.pipe(writer);
     let error: any = null;
-    response.data.on('error', (err) => { error = err; try { writer.close(); } catch (e) { } ; reject(err); });
-    writer.on('error', (err) => { error = err; try { writer.close(); } catch (e) { } ; reject(err); });
-    writer.on('close', () => { if (!error) resolve(); else reject(error); });
+    const cleanup = () => {
+      if (stallTimer) {
+        clearInterval(stallTimer);
+        stallTimer = null;
+      }
+    };
+    stallTimer = setInterval(() => {
+      try {
+        if (Date.now() - lastChunkAt <= stallTimeoutMs) return;
+        const err = new Error(`download stalled for ${stallTimeoutMs}ms`);
+        response.data.destroy(err);
+        writer.destroy(err);
+      } catch (e) {}
+    }, 1000);
+    response.data.on('error', (err) => { error = err; cleanup(); try { writer.close(); } catch (e) { } ; reject(err); });
+    writer.on('error', (err) => { error = err; cleanup(); try { writer.close(); } catch (e) { } ; reject(err); });
+    writer.on('close', () => { cleanup(); if (!error) resolve(); else reject(error); });
   });
 
   const result: ResumeDownloadResult = { bytes: received };

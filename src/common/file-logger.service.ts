@@ -493,8 +493,7 @@ export class FileLoggerService implements LoggerService {
     if (m) return `worker-${m[1]}`;
     const safe = String(raw).trim().replace(/[^a-zA-Z0-9]/g, '');
     if (safe) {
-      const short = safe.slice(-2).toLowerCase();
-      return `worker-${short}`;
+      return `worker-${safe.toLowerCase()}`;
     }
     return 'worker-unknown';
   }

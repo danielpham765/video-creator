@@ -1,203 +1,259 @@
-## Video Downloader API – Developer Architecture
+## Video Downloader API - Developer Architecture
+
+Last updated: 2026-02-28
 
 ### High-level overview
 
-- **Purpose**: Background-friendly Bilibili video downloader. The HTTP API accepts a `bvid` (and optional cookies), resolves playback URLs via Bilibili APIs, downloads streams reliably (with resume/cancel/stop), merges audio+video with `ffmpeg`, and writes result files to a local `data/` directory.
-- **Style**: NestJS modules + Bull queue workers. The HTTP layer is thin; almost all work happens in a Bull processor that can run in a separate worker process/container.
-- **Persistence**: No DB. Job state is in Bull/Redis; job history and marker files live under `data/`.
+- Purpose: background-friendly Bilibili downloader. API receives download requests, worker resolves playable URLs, downloads, merges, and stores final files in `data/`.
+- Stack: NestJS + Bull + Redis + FFmpeg.
+- Persistence: Bull/Redis for queue state, filesystem for artifacts/history (`data/`, `logs/`).
 
-### Core runtime processes
+### Runtime topology
 
-- **API process** (`nest start` / `start:dev`)
-  - Exposes REST endpoints under `/download`.
-  - Enqueues background jobs into the `downloads` Bull queue.
-  - Reads job status/result from Bull and from job-history JSON files.
-  - Emits stop/cancel signals: the resume controller now writes a Redis stop key `job:stop:<id>` (with a short TTL) and waits for the worker to acknowledge `stopped` before requeuing; as a fallback the API may write filesystem stop markers. The cancel endpoint still writes `data/<id>.cancel` (recommended to convert to Redis for cross-host durability).
+- API process (`WORKER` unset/false):
+  - Exposes `/download` endpoints.
+  - Enqueues master jobs to queue `downloads`.
+  - Reads status from Bull + Redis + history files.
+- Worker process (`WORKER=true`):
+  - Loads `WorkerModule`.
+  - Consumes queue `downloads` (master jobs) and `download-parts` (part jobs).
 
-- **Worker process** (`node dist/worker.js`, see `WorkerProcessor`)
-  - Subscribes to the `downloads` queue.
-  - For each job:
-    - Resolves Bilibili `cid` and `playurl`.
-    - Chooses between DASH (`dash`) vs fallback `durl` download strategy.
-    - Uses `resumeDownload()` to fetch stream(s) robustly with resume support. The worker now listens for stop requests via a duplicated Redis client (pub/sub) and falls back to polling the `job:stop:<id>` key; when a stop is received the worker sets a `stopRequested` flag that is passed into `resumeDownload()` so downloads abort cooperatively. The worker cleans up the subscriber (unsubscribe/disconnect) and removes the stop key on acknowledgement.
-    - Invokes `FfmpegService.merge()` when separate audio/video streams exist.
-    - Writes progress and history events.
-    - Honors stop/cancel signals cooperatively.
+### Queue model
+
+- `downloads`:
+  - One master job per request.
+  - Processor: `WorkerProcessor`.
+- `download-parts`:
+  - Part jobs for `dash-segmented` and `durl-byte-range`.
+  - Processor: `PartsProcessor`.
 
 ### Module and service map
 
-- **`DownloadModule`** (`src/download/download.module.ts`)
-  - Imports:
-    - `BullModule.registerQueue({ name: 'downloads' })`
-    ```markdown
-    ## Video Downloader API – Developer Architecture
+- `DownloadModule`:
+  - wires `DownloadController` and `DownloadService`.
+  - registers queue `downloads`.
+- `PlayurlService`:
+  - resolves `cid` and `playurl` from Bilibili APIs.
+- `WorkerProcessor`:
+  - handles master `downloads` jobs (strategy select, merge, history).
+- `PartsProcessor`:
+  - handles `download-parts` jobs (segments/ranges).
+- `FfmpegService`:
+  - merges streams and concat-lists.
+- `JobHistoryService`:
+  - persists lifecycle events under `data/jobs/<jobId>.json`.
 
-    ### High-level overview
+### API routes
 
-    - **Purpose**: Background-friendly Bilibili video downloader. The HTTP API accepts a `bvid` (and optional cookies), resolves playback URLs via Bilibili APIs, downloads streams reliably (with resume/cancel/stop), merges audio+video with `ffmpeg`, and writes result files to a local `data/` directory.
-    - **Style**: NestJS modules + Bull queue workers. The HTTP layer is thin; almost all work happens in a Bull processor that can run in a separate worker process/container.
-    - **Persistence**: No DB. Job state is in Bull/Redis; job history and marker files live under `data/`.
+- `POST /download`
+  - Body DTO: `CreateDownloadDto` (`url` required, `title` optional).
+  - Controller extracts `bvid` from URL (or uses provided `bvid` internally), enqueues job payload `{ bvid, url, title }`.
+- `GET /download/status/:id`
+  - Returns job `state`, `progress`, `failedReason`, `result`, `history`.
+  - Adds parts summary from Redis hash `job:parts:<id>`.
+- `POST /download/:id/resume`
+  - Sends stop signal (`job:stop:<id>`), waits for `stopped`, then enqueues new job.
+- `POST /download/:id/cancel`
+  - Creates cancel marker and Redis cancel key (`job:cancel:<id>`), best-effort removes queued job.
+- `POST /download/:id/merge-partial`
+  - Partial merge helper for `durl-byte-range` manifests.
 
-    ### Recent changes (Feb 2026)
+### Source and auth inputs
 
-    - `POST /download` now validates request bodies with a DTO and is visible in Swagger (see `src/download/dto/create-download.dto.ts`).
-    - App bootstrap moved to `src/main.ts`: global `ValidationPipe`, global `LoggingInterceptor`, and Swagger/OpenAPI configured at `/api` and `/docs`.
-    - `AppModule` is a dynamic registrar (`AppModule.register()`) so the same image can run as the API or a worker. The `WorkerModule` is only loaded when `WORKER=true`.
-    - `BullModule.forRootAsync()` has been added into the dynamic `AppModule.register()` so the API can enqueue jobs even if the worker is separate.
-    - `resumeDownload()` accepts an `options.logger` now and worker code passes Nest `Logger` (so download progress appears in Nest logs).
-    - `DownloadService.enqueue()` now maps queue/Redis enqueue errors to HTTP 503 so API clients see a clear "Queue service unavailable" response when Redis is down.
-    - A global `LoggingInterceptor` logs requests/responses; it required adding `rxjs` as a dependency.
-    - Docker/docker-compose changes: development mounts were adjusted to avoid hiding container-installed `node_modules` (use an anonymous or named volume for `node_modules`), and `docker-compose` is used to scale worker replicas for parallel processing.
+- Cookies are loaded by worker from `config/cookies.json`.
+- Request body does not carry cookies.
+- Supported cookie formats in file:
+  - browser export array (`[{name,value}, ...]`)
+  - key/value object
+  - plain cookie string
 
-    ### Core runtime processes
+### Title and output naming flow
 
-    - **API process** (`nest start` / `start:dev`)
-      - Exposes REST endpoints under `/download`.
-      - Enqueues background jobs into the `downloads` Bull queue.
-      - Reads job status/result from Bull and from job-history JSON files.
-      - Emits stop/cancel signals: the resume controller writes a Redis stop key `job:stop:<id>` (with a short TTL) and waits for the worker to acknowledge `stopped` before requeuing; as a fallback the API may write filesystem stop markers. The cancel endpoint still writes `data/<id>.cancel` (recommended to convert to Redis for cross-host durability).
+- If request has `title`: use it.
+- If request has no `title`:
+  - worker fetches source title via Bilibili view API.
+  - if title is not Vietnamese/English script, worker attempts translation to Vietnamese.
+- Folder title normalization:
+  - Vietnamese/Latin: remove accents, lowercase, spaces -> `-`, trim duplicates.
+  - Chinese/CJK: keep original (sanitized for path-invalid chars).
+- Final path:
+  - `data/bilibili/<normalizedTitle>/<bvid>-<jobId>.mp4`
 
-    - **Worker process** (`node dist/worker.js`, see `WorkerProcessor`)
-      - Subscribes to the `downloads` queue.
-      - For each job:
-        - Resolves Bilibili `cid` and `playurl`.
-        - Chooses between DASH (`dash`) vs fallback `durl` download strategy.
-        - Uses `resumeDownload()` to fetch stream(s) robustly with resume support. The worker listens for stop requests via a duplicated Redis client (pub/sub) and falls back to polling the `job:stop:<id>` key; when a stop is received the worker sets a `stopRequested` flag that is passed into `resumeDownload()` so downloads abort cooperatively. The worker cleans up the subscriber (unsubscribe/disconnect) and removes the stop key on acknowledgement.
-        - Invokes `FfmpegService.merge()` when separate audio/video streams exist.
-        - Writes progress and history events.
-        - Honors stop/cancel signals cooperatively.
+### Strategy selection (current order)
 
-    ### Module and service map
+Selection logic is in `src/worker/worker.processor.ts` and follows this order:
 
-    - **`DownloadModule`** (`src/download/download.module.ts`)
-      - Imports:
-        - `BullModule.registerQueue({ name: 'downloads' })`
-        - `JobsModule` (job history)
-        - `PlayurlModule` (Bilibili API client)
-        - `FfmpegModule` (merge helper)
-      - Declares:
-        - `DownloadController`
-        - `DownloadService`
+1. `dash-segmented`
+2. `durl-byte-range`
+3. `dash-single`
+4. `durl` (single file)
 
-    - **`DownloadController`** (`src/download/download.controller.ts`)
-      - **Routes**
-        - `POST /download`
-          - Body: `CreateDownloadDto` (`url` required, `title` optional) — validated by `class-validator`.
-          - Calls `DownloadService.enqueue(body)` which enqueues to `downloads` queue.
-          - Returns `{ jobId }` for client-side polling.
-        - `GET /download/status/:id`
-          - Looks up a Bull job by id and reads job-related keys from Redis to build a progress view.
-          - Returns `state`, `progress`, `failedReason`, `result`, and `history` (from job history JSON).
-        - `POST /download/:id/resume` and `POST /download/:id/cancel` — see implementation notes in `src/download/download.controller.ts` for cooperative stop/resume and cancel semantics.
+#### 1) `dash-segmented`
 
-    - **`DownloadService`** (`src/download/download.service.ts`)
-      - Thin abstraction over Bull: injects `Queue` for `downloads` and exposes `enqueue(payload)` which catches enqueue errors and throws a 503 when Redis/queue is unavailable.
+- Condition:
+  - `play.data.dash` has video/audio URLs.
+  - manifest detection succeeds (`#EXTM3U` or `<MPD>`).
+- Flow:
+  - parse manifests -> segment URLs.
+  - group segments into parts.
+  - enqueue `download-parts` for video/audio.
+  - wait part completion, concat parts, merge A/V with ffmpeg.
+- Notes:
+  - best for long content.
+  - uses part-job concurrency controls.
 
-    - **`PlayurlModule` / `PlayurlService`** (`src/playurl`)
-      - `getCidFromBvid(bvid)` and `getPlayurl(bvid, cid, cookies?)` — Bilibili API wrappers used by the worker.
+#### 2) `durl-byte-range`
 
-    - **`FfmpegModule` / `FfmpegService`** (`src/ffmpeg`)
-      - Wraps `fluent-ffmpeg` for merging video+audio (`-c copy` by default).
+- Condition:
+  - `durl` URL exists.
+  - origin supports true range:
+    - HEAD has `content-length`.
+    - `accept-ranges` contains `bytes`.
+    - size >= `2 * partSizeBytes`.
+    - probe GET `Range: bytes=0-1` returns `206`.
+- Flow:
+  - split by byte ranges.
+  - enqueue `download-parts`.
+  - concat parts into final media file.
+- Notes:
+  - preferred over `dash-single` when applicable.
 
-    - **`JobsModule` / `JobHistoryService`** (`src/jobs`)
-      - Persists lifecycle events to `data/jobs/<jobId>.json` and provides `appendEvent()` / `getHistory()` helpers used by controllers and workers.
+#### 3) `dash-single`
 
-    - **`WorkerProcessor`** (`src/worker/worker.processor.ts`)
-      - `@Processor('downloads')` handles job lifecycle: resolving, downloading (via `resumeDownload()`), merging, and appending history. Worker handles stop/cancel keys and passes Nest `Logger` into `resumeDownload()` so progress logs appear in container logs.
+- Condition:
+  - DASH URLs available.
+  - segmented path not applicable.
+  - and no successful `durl-byte-range` branch.
+- Flow:
+  - master downloads full video stream + full audio stream.
+  - ffmpeg merge.
+- Notes:
+  - has byte-based debug progress logging.
+  - resume support via `Range` when partial temp files exist.
 
-    - **`resumeDownload` util** (`src/utils/resume-download.ts`)
-      - Streams HTTP content to disk with Range/resume support, cooperative stop/cancel via a function or marker file, and accepts an `options.logger` to emit progress using Nest `Logger`.
+#### 4) `durl` (single file)
 
-    ### Data layout on disk
+- Condition:
+  - `durl` URL exists.
+  - byte-range parallel not applicable.
+- Flow:
+  - master downloads single URL via `resumeDownload()`.
+- Notes:
+  - also has byte-based debug progress logging.
 
-    - `data/`
-      - `<bvid>-<jobId>.mp4` – final outputs.
-      - `<jobId>-video`, `<jobId>-audio` – transient DASH download files.
-      - `<jobId>.cancel` – cancel marker, written by controller; read by worker and `resumeDownload`.
-      - `<jobId>.stop` – stop marker alternative to Redis pub/sub.
-      - `jobs/` — `<jobId>.json` – append-only array of history events.
+### Progress accounting
 
-    ### Queue & Redis integration
+- Total expected bytes are stored in Redis hash `job:parts:<jobId>`:
+  - `totalExpectedBytes`
+  - `part:<i>:expectedBytes`, `part:<i>:downloadedBytes`, `part:<i>:state`
+  - `part:audio:<i>:...` for audio parts
+- Master jobs map byte progress to job progress ranges (for example segmented phases around 30-79).
 
-    - **Queue name**: `downloads` (registered via `BullModule.registerQueue({ name: 'downloads' })`).
-    - **Stop signaling**: Redis key `job:stop:<id>` (workers prefer pub/sub and fall back to polling); workers duplicate the Bull client for a subscriber and set `stopRequested` flag.
-    - **Cancel signaling**: filesystem marker `data/<id>.cancel` (recommended future improvement: migrate to Redis `job:cancel:<id>` + pub/sub).
+### Concurrency and limiter model
 
-    ### Error handling and job states (practical view)
+#### Master job concurrency (`downloads`)
 
-    - Common states: `queued`, `resolving`, `downloading-video`, `downloading-audio`, `merging`, `finished`, `failed`, `cancelled`, `stopped`, `resume-requested`, etc.
+- Controlled by:
+  - `worker.concurrency`
+  - `download.singleMaxConcurrentDownloads`
+- Effective master slot count in worker:
+  - `min(worker.concurrency, download.singleMaxConcurrentDownloads)`
 
-    ### Extensibility notes
+#### Part job concurrency (`download-parts`)
 
-    - New sources: implement resolvers like `PlayurlService` and branch in `WorkerProcessor`.
-    - Stronger API contracts: DTOs + `@nestjs/swagger` already in place for `POST /download`.
+- Per worker process limit:
+  - `download.parallelMaxConcurrentDownloads`
+- Global limit across all replicas/processes:
+  - `download.globalParallelMaxConcurrentDownloads`
+  - Redis ZSET semaphore key: `semaphore:downloads:parallel:global`
 
-    ### How to run locally (api vs worker)
+#### Single-download global limit
 
-    Run the full stack (api + worker + redis):
+- For `dash-single` and `durl` single path, worker acquires global permit from:
+  - `download.globalSingleMaxConcurrentDownloads`
+  - Redis ZSET semaphore key: `semaphore:downloads:single:global`
 
-    ```bash
-    docker compose up --build -d
-    ```
+#### Lease-based permit behavior
 
-    Run only the API (same image, no workers running in-process):
+- `download.globalLimiterLeaseMs`:
+  - permit lease TTL window.
+  - expired tokens are reclaimed automatically.
+- `download.globalLimiterWaitMs`:
+  - retry interval while waiting for permit.
+- Tokens are periodically renewed; on completion they are released.
 
-    ```bash
-    # API-only (recommended for local dev)
-    docker compose up --build -d api
-    ```
+### Stop/cancel behavior
 
-    Run a worker replica (sets `WORKER=true` so the dynamic module loads `WorkerModule`):
+- Stop:
+  - Redis key/channel `job:stop:<id>` + optional file fallback `data/<id>.stop`.
+- Cancel:
+  - Redis key/channel `job:cancel:<id>` + marker `data/<id>.cancel`.
+- Worker and `resumeDownload()` check these signals cooperatively.
 
-    ```bash
-    # start one worker
-    docker compose up --build -d --no-deps --scale worker=1 worker
+### Logging architecture
 
-    # scale to N workers for parallelism
-    docker compose up -d --no-deps --scale worker=4 worker
-    ```
+Logger: `FileLoggerService` (used as Nest logger in `main.ts`).
 
-    Notes:
-    - The runtime checks `WORKER=true` to decide whether to register `WorkerModule` — this allows the same container image to be launched as API or worker.
-    - If Redis is not available, `POST /download` will return 503; start `redis` first in `docker compose`.
+- Console output:
+  - only `info` level is printed.
+- Service log folders:
+  - API: `logs/api`
+  - Worker instance: `logs/worker/<worker-label>`
+  - Worker aggregate: `logs/worker/app.*.log`
+- Per-folder files:
+  - `app.info.log`: info + warn + error
+  - `app.warn.log`: warn + error
+  - `app.error.log`: error
+  - `app.debug.log`: debug + info + warn + error
+- Worker line prefix:
+  - `worker-<index>  | ...`
+  - If numeric worker index is not available, logger uses last 2 chars of host/process label.
 
-    ### Logs & verifying parallelism
+### Log rotation and archive
 
-    To attribute log lines to particular worker containers, capture logs with container prefixes (don't use `--no-log-prefix`):
+- Rotation is checked periodically; if any managed log file exceeds configured size, logger rotates all managed log files together.
+- Archive file name format: `yyyy-mm-dd_hh-mm-ss.zip` (with suffix `_n` if collision).
+- Destinations:
+  - local (`logs/archived`)
+  - S3 (configurable bucket/prefix/credentials/endpoint)
+- Retention:
+  - local: max files and optional retention days.
+  - S3: retention days cleanup.
 
-    ```bash
-    docker compose logs --tail=200 worker
-    ```
+### Key config fields (`config/config.yaml`)
 
-    Or fetch per-container logs after `docker compose ps` so you can see which replica handled each `download` / `download-parts` job.
+- `worker.concurrency`
+- `download.partSizeBytes` (interpreted as MB)
+- `download.parallelMaxConcurrentDownloads`
+- `download.singleMaxConcurrentDownloads`
+- `download.globalParallelMaxConcurrentDownloads`
+- `download.globalSingleMaxConcurrentDownloads`
+- `download.globalLimiterLeaseMs`
+- `download.globalLimiterWaitMs`
+- `download.retryCount`
+- `download.resumeEnabled`
+- `logging.level`
+- `logging.rotate.*`
 
-    If you want, I can fetch and parse prefixed worker logs now to annotate which worker processed each part.
+### Filesystem layout
 
-    ## Flow diagram
+- `data/`
+  - `bilibili/<safeTitle>/<bvid>-<jobId>.mp4`
+  - `<jobId>/manifest.json`
+  - `<jobId>/parts/part-<i>.bin`, `audio-part-<i>.bin`
+  - `<jobId>.cancel`, `<jobId>.stop`
+  - `jobs/<jobId>.json`
+- `logs/`
+  - `api/app.*.log`
+  - `worker/<worker-label>/app.*.log`
+  - `worker/app.*.log` (aggregate workers)
+  - `archived/*.zip`
 
-    ```mermaid
-    flowchart LR
-      Client[Client\n(HTTP request)] --> API[API / DownloadController]
-      API --> Queue[Bull queue: downloads]
-      API -->|SET `job:stop:<id>` / write stop marker| Redis[Redis (pub/sub & keys)]
-      API -->|write `data/<id>.cancel`| Disk[Disk (`data/`)]
+### Local run notes
 
-      Queue --> Worker[WorkerProcessor]
-      Redis -->|pub/sub or GET| Worker
-      Worker -->|calls| Resume[`resumeDownload()` util]
-      Resume -->|writes partials| Disk
-      Worker -->|on DASH: download segments| Disk
-      Worker -->|on merge| Ffmpeg[FfmpegService (merge)]
-      Ffmpeg -->|final file| Disk
-      Worker -->|append events| Jobs[JobHistory (`data/jobs/<id>.json`)]
-
-      API -->|requeue after stop| Queue
-
-      classDef infra fill:#f9f,stroke:#333,stroke-width:1px;
-      class Redis,Disk,Jobs infra;
-    ```
-
-    This diagram shows the high-level message flow: the API enqueues jobs and signals stop/cancel via Redis or disk markers; the `WorkerProcessor` subscribes to Redis (or polls) and passes a `stopRequested()` function into `resumeDownload()` so downloads can abort cooperatively; after downloads finish the worker runs `FfmpegService.merge()` and records history in `data/jobs/`.
-  - `cancelled`
-
-  - `stopped`, `stop-requested`, `stop-timeout`, `resume-requested`, `requeueing`, `requeue-failed`
+- Full stack:
+  - `docker compose up --build -d`
+- API only:
+  - `docker compose up --build -d api`
+- Scale workers:
+  - `docker compose up -d --no-deps --scale worker=4 worker`

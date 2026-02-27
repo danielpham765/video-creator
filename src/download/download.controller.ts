@@ -100,7 +100,6 @@ export class DownloadController {
     if (!job) throw new NotFoundException('job not found');
     const data = job.data || {};
     const bvid = data.bvid;
-    const cookies = data.cookies;
     if (!bvid) throw new NotFoundException('bvid missing from job data');
 
     const cfgDataDir = String(this.config.get('download.dataDir') || path.join(process.cwd(), 'data'));
