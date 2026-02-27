@@ -3,6 +3,10 @@ services:
   redis:
     image: redis:7
     restart: unless-stopped
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
 
   api:
     build:
@@ -34,3 +38,4 @@ services:
 
 volumes:
   node_modules: {}
+  redis-data: {}

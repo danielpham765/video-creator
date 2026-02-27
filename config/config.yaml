@@ -1,0 +1,64 @@
+# Central configuration (human-friendly).
+# Override any value with environment variables documented next to each key.
+
+server:
+  # ENV: NODE_ENV
+  nodeEnv: development
+  # ENV: PORT
+  port: 3000
+
+redis:
+  # Full connection URL (ENV: REDIS_URL). If set, it takes precedence.
+  url: redis://redis:6379
+  # ENV: REDIS_HOST
+  host: redis
+  # ENV: REDIS_PORT
+  port: 6379
+  # ENV: REDIS_PASSWORD
+  password: ""
+
+worker:
+  # ENV: WORKER_CONCURRENCY
+  concurrency: 4
+  # ENV: BULL_QUEUE_PREFIX
+  queuePrefix: ""
+
+download:
+  # Where download artifacts and manifests are stored (ENV: DATA_DIR)
+  dataDir: /usr/src/app/data
+  # Size per part when splitting (in megabytes). Default: 8 (ENV: PART_SIZE_BYTES)
+  # Note: application should interpret this value as MB and convert to bytes.
+  partSizeBytes: 8
+  # Max concurrent part downloads per process (ENV: MAX_CONCURRENT_DOWNLOADS)
+  maxConcurrentDownloads: 100
+  # Retry attempts for transient failures (ENV: DOWNLOAD_RETRY_COUNT)
+  retryCount: 3
+  # Toggle resumable downloads on/off (ENV: RESUME_DOWNLOAD_ENABLED)
+  resumeEnabled: true
+
+ffmpeg:
+  # Path to ffmpeg binary or package-provided executable (ENV: FFMPEG_PATH)
+  path: ffmpeg
+  # Timeout (seconds) allowed for merge operations (ENV: FFMPEG_MERGE_TIMEOUT_SEC)
+  mergeTimeoutSec: 300
+
+proxy:
+  # ENV: HTTP_PROXY
+  http: ""
+  # ENV: HTTPS_PROXY
+  https: ""
+
+logging:
+  # ENV: LOG_LEVEL (e.g. debug, info, warn, error)
+  level: debug
+
+app:
+  # Interval (ms) for Bull stalled-check housekeeping (ENV: BULL_STALLED_CHECK_INTERVAL_MS)
+  bullStalledCheckIntervalMs: 30000
+
+# Notes:
+# - To override any value, set the corresponding environment variable shown in the
+#   inline comments (e.g. `export REDIS_URL=redis://user:pass@host:6379`).
+# - This file is intended for humans and documentation; runtime configuration
+#   can be loaded into the application (example: using a ConfigService) which
+#   reads environment variables or this YAML as desired.

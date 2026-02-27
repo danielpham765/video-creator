@@ -5,9 +5,11 @@ import { BullModule } from '@nestjs/bull';
 import { JobsModule } from '../jobs/jobs.module';
 import { PlayurlModule } from '../playurl/playurl.module';
 import { FfmpegModule } from '../ffmpeg/ffmpeg.module';
+import { AppConfigModule } from '../config/config.module';
 
 @Module({
   imports: [
+    AppConfigModule,
     BullModule.registerQueue(
       { name: 'downloads' },
       { name: 'download-parts' },

@@ -18,6 +18,7 @@ export async function resumeDownload(
   stopFileOrCheck?: string | StopCheckFn,
   onProgress?: ProgressCallback,
   computeMd5: boolean = false,
+  options?: { timeoutMs?: number; proxy?: string },
 ): Promise<ResumeDownloadResult> {
   const start = fs.existsSync(dest) ? fs.statSync(dest).size : 0;
   const reqHeaders: Record<string, string> = Object.assign({}, headers || {});
@@ -26,17 +27,39 @@ export async function resumeDownload(
     console.log(`[download] Resuming ${dest} from ${start}`);
   }
 
-  const response = await axios.get(url, {
+  // debug: print what we're about to request
+  try {
+    console.debug && console.debug(`[download] request ${url} -> ${dest} headers=${JSON.stringify(reqHeaders)}`);
+  } catch (e) {}
+
+  // Allow overriding timeout and proxy via options (backwards-compatible)
+  const timeout = (options && options.timeoutMs) ? Number(options.timeoutMs) : 30000;
+  const axiosConfig: any = {
     responseType: 'stream',
     headers: reqHeaders,
-    timeout: 30000,
-    validateStatus: (status) => (status >= 200 && status < 300) || status === 206,
-  });
+    timeout,
+    validateStatus: (status: number) => (status >= 200 && status < 300) || status === 206,
+  };
+  if (options && options.proxy) {
+    try {
+      const p = new URL(String(options.proxy));
+      const proxyObj: any = { host: p.hostname, port: Number(p.port) || (p.protocol === 'https:' ? 443 : 80) };
+      if (p.username || p.password) proxyObj.auth = { username: decodeURIComponent(p.username), password: decodeURIComponent(p.password) };
+      axiosConfig.proxy = proxyObj;
+    } catch (e) {
+      // ignore invalid proxy URL and let axios use env proxies
+    }
+  }
+  const response = await axios.get(url, axiosConfig);
+
+  try {
+    console.debug && console.debug(`[download] response status=${response.status} content-length=${response.headers['content-length'] || 'unknown'}`);
+  } catch (e) {}
 
   if (start > 0 && response.status === 200) {
     console.log(`[download] Server ignored Range; restarting ${dest}`);
     try { fs.unlinkSync(dest); } catch (e) { }
-    return resumeDownload(url, dest, headers, cancelFilePath, stopFileOrCheck, onProgress, computeMd5);
+    return resumeDownload(url, dest, headers, cancelFilePath, stopFileOrCheck, onProgress, computeMd5, options);
   }
 
   const contentLength = parseInt(response.headers['content-length'] || '0', 10) || 0;
@@ -72,15 +95,17 @@ export async function resumeDownload(
         const err = new Error('download cancelled');
         response.data.destroy(err);
         try { writer.close(); } catch (e) { }
+        try { console.debug && console.debug(`[download] cancelled via cancelFile=${cancelFilePath}`); } catch (e) {}
         return;
       }
       // support either a stop-file path or a stop-check function
       if (stopFileOrCheck) {
-        if (typeof stopFileOrCheck === 'string') {
+          if (typeof stopFileOrCheck === 'string') {
           if (fs.existsSync(stopFileOrCheck)) {
             const err = new Error('download stopped');
             response.data.destroy(err);
             try { writer.close(); } catch (e) { }
+            try { console.debug && console.debug(`[download] stopped via stopFile=${stopFileOrCheck}`); } catch (e) {}
             return;
           }
         } else if (typeof stopFileOrCheck === 'function') {
@@ -89,6 +114,7 @@ export async function resumeDownload(
               const err = new Error('download stopped');
               response.data.destroy(err);
               try { writer.close(); } catch (e) { }
+              try { console.debug && console.debug(`[download] stopped via stop-check function for ${dest}`); } catch (e) {}
               return;
             }
           } catch (e) {

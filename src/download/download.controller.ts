@@ -4,6 +4,7 @@ import { Queue } from 'bull';
 import { DownloadService } from './download.service';
 import { JobHistoryService } from '../jobs/job-history.service';
 import { FfmpegService } from '../ffmpeg/ffmpeg.service';
+import { ConfigService } from '@nestjs/config';
 
 import * as path from 'path';
 import * as fs from 'fs';
@@ -15,6 +16,7 @@ export class DownloadController {
     @InjectQueue('downloads') private readonly downloadQueue: Queue,
     private readonly history: JobHistoryService,
     private readonly ffmpeg: FfmpegService,
+    private readonly config: ConfigService,
   ) {}
 
   @Post()
@@ -32,7 +34,44 @@ export class DownloadController {
     const failedReason = job.failedReason || null;
     const result = job.returnvalue || null;
     const history = await this.history.getHistory(id);
-    return { id: job.id, state, progress, failedReason, result, history };
+    // Try to include parts progress from Redis if available
+    const client: any = (this.downloadQueue as any).client;
+    let partsSummary: any = null;
+    try {
+      if (client && typeof client.hgetall === 'function') {
+        const key = `job:parts:${id}`;
+        const raw = await client.hgetall(key);
+        if (raw && Object.keys(raw).length) {
+          // parse parts into a structured object
+          const parts: any[] = [];
+          let totalExpected = 0;
+          let totalDownloaded = 0;
+          Object.keys(raw).forEach((k) => {
+            const m = k.match(/^part:(\d+):(expectedBytes|downloadedBytes|state)$/);
+            if (m) {
+              const idx = parseInt(m[1], 10);
+              const field = m[2];
+              parts[idx] = parts[idx] || { partIndex: idx };
+              if (field === 'expectedBytes') parts[idx].expectedBytes = parseInt(raw[k] || '0', 10) || 0;
+              if (field === 'downloadedBytes') parts[idx].downloadedBytes = parseInt(raw[k] || '0', 10) || 0;
+              if (field === 'state') parts[idx].state = raw[k];
+            }
+            if (k === 'totalExpectedBytes') {
+              totalExpected = parseInt(raw[k] || '0', 10) || 0;
+            }
+          });
+          for (const p of parts) {
+            if (!p) continue;
+            totalDownloaded += p.downloadedBytes || 0;
+          }
+          partsSummary = { parts: parts.filter(Boolean), totalExpectedBytes: totalExpected, totalDownloadedBytes: totalDownloaded };
+        }
+      }
+    } catch (e) {
+      // ignore redis errors
+    }
+
+    return { id: job.id, state, progress, failedReason, result, history, parts: partsSummary };
   }
 
   @Post(':id/resume')
@@ -44,7 +83,8 @@ export class DownloadController {
     const cookies = data.cookies;
     if (!bvid) throw new NotFoundException('bvid missing from job data');
 
-    const DATA_DIR = path.resolve(process.cwd(), 'data');
+    const cfgDataDir = String(this.config.get('download.dataDir') || path.join(process.cwd(), 'data'));
+    const DATA_DIR = path.isAbsolute(cfgDataDir) ? cfgDataDir : path.resolve(process.cwd(), cfgDataDir);
     const stopKey = `job:stop:${id}`;
 
     // signal worker to stop the currently active job by writing a Redis key
@@ -106,7 +146,8 @@ export class DownloadController {
   @Post(':id/cancel')
   async cancel(@Param('id') id: string) {
     const job = await this.downloadQueue.getJob(id as any);
-    const DATA_DIR = path.resolve(process.cwd(), 'data');
+    const cfgDataDir = String(this.config.get('download.dataDir') || path.join(process.cwd(), 'data'));
+    const DATA_DIR = path.isAbsolute(cfgDataDir) ? cfgDataDir : path.resolve(process.cwd(), cfgDataDir);
     const cancelFile = path.join(DATA_DIR, `${id}.cancel`);
     try {
       // create cancel marker for worker to cooperatively stop
@@ -114,6 +155,20 @@ export class DownloadController {
       fs.writeFileSync(cancelFile, String(Date.now()));
     } catch (e) {
       // ignore
+    }
+
+    // also set Redis cancellation key so remote workers see it
+    try {
+      const client: any = (this.downloadQueue as any).client;
+      const cancelKey = `job:cancel:${id}`;
+      if (client && typeof client.set === 'function') {
+        await client.set(cancelKey, String(Date.now()), 'EX', 60);
+        if (typeof client.publish === 'function') {
+          try { await client.publish(cancelKey, '1'); } catch (e) { }
+        }
+      }
+    } catch (e) {
+      // ignore redis errors
     }
 
     if (job) {
@@ -131,7 +186,8 @@ export class DownloadController {
   @Post(':id/merge-partial')
   async mergePartial(@Param('id') id: string) {
     const jobId = String(id);
-    const DATA_DIR = path.resolve(process.cwd(), 'data');
+    const cfgDataDir = String(this.config.get('download.dataDir') || path.join(process.cwd(), 'data'));
+    const DATA_DIR = path.isAbsolute(cfgDataDir) ? cfgDataDir : path.resolve(process.cwd(), cfgDataDir);
     const manifestDir = path.join(DATA_DIR, jobId);
     const manifestPath = path.join(manifestDir, 'manifest.json');
     if (!fs.existsSync(manifestPath)) {

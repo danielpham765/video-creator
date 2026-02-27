@@ -1,19 +1,23 @@
+
 import { Injectable, Logger } from '@nestjs/common';
+import { ConfigService } from '@nestjs/config';
 import * as fs from 'fs';
 import * as path from 'path';
-
-const JOBS_DIR = path.resolve(process.cwd(), 'data', 'jobs');
 
 @Injectable()
 export class JobHistoryService {
   private readonly logger = new Logger(JobHistoryService.name);
+  private readonly jobsDir: string;
 
-  constructor() {
-    if (!fs.existsSync(JOBS_DIR)) fs.mkdirSync(JOBS_DIR, { recursive: true });
+  constructor(private readonly config: ConfigService) {
+    const cfgDataDir = String(this.config.get('download.dataDir') || path.join(process.cwd(), 'data'));
+    const dataDir = path.isAbsolute(cfgDataDir) ? cfgDataDir : path.resolve(process.cwd(), cfgDataDir);
+    this.jobsDir = path.join(dataDir, 'jobs');
+    if (!fs.existsSync(this.jobsDir)) fs.mkdirSync(this.jobsDir, { recursive: true });
   }
 
   filePath(jobId: string) {
-    return path.join(JOBS_DIR, `${jobId}.json`);
+    return path.join(this.jobsDir, `${jobId}.json`);
   }
 
   async appendEvent(jobId: string, event: any) {

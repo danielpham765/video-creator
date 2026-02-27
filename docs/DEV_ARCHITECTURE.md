@@ -12,14 +12,14 @@
   - Exposes REST endpoints under `/download`.
   - Enqueues background jobs into the `downloads` Bull queue.
   - Reads job status/result from Bull and from job-history JSON files.
-  - Emits stop/cancel signals via Redis and filesystem markers.
+  - Emits stop/cancel signals: the resume controller now writes a Redis stop key `job:stop:<id>` (with a short TTL) and waits for the worker to acknowledge `stopped` before requeuing; as a fallback the API may write filesystem stop markers. The cancel endpoint still writes `data/<id>.cancel` (recommended to convert to Redis for cross-host durability).
 
 - **Worker process** (`node dist/worker.js`, see `WorkerProcessor`)
   - Subscribes to the `downloads` queue.
   - For each job:
     - Resolves Bilibili `cid` and `playurl`.
     - Chooses between DASH (`dash`) vs fallback `durl` download strategy.
-    - Uses `resumeDownload()` to fetch stream(s) robustly with resume support.
+    - Uses `resumeDownload()` to fetch stream(s) robustly with resume support. The worker now listens for stop requests via a duplicated Redis client (pub/sub) and falls back to polling the `job:stop:<id>` key; when a stop is received the worker sets a `stopRequested` flag that is passed into `resumeDownload()` so downloads abort cooperatively. The worker cleans up the subscriber (unsubscribe/disconnect) and removes the stop key on acknowledgement.
     - Invokes `FfmpegService.merge()` when separate audio/video streams exist.
     - Writes progress and history events.
     - Honors stop/cancel signals cooperatively.
@@ -51,22 +51,22 @@
         - `result` (worker return value, usually `{ path }` or flags like `{ cancelled: true }`)
         - `history` (array of events from `JobHistoryService`)
     - `POST /download/:id/resume`
-      - Coordinates a **cooperative stop then resume** for a running job:
+      - Coordinates a **cooperative stop then resume** for a running job; resume execution occurs in the worker (the API only signals and requeues):
         1. Resolves the Bull job and reads its `data` (expects `bvid`, `cookies`).
         2. Emits a stop signal:
-           - Prefer Redis: uses the underlying Bull Redis client to `SET job:stop:<id>`.
+           - Prefer Redis: sets `job:stop:<id>` with a short TTL so workers across hosts can see it.
            - Fallback: writes a `data/<id>.stop` marker file.
-        3. Appends `{ state: 'stop-requested' }` to history.
-        4. Polls history for up to ~15s until it sees a `stopped` event from the worker.
-        5. Clears the stop key/marker.
-        6. Re-enqueues a new job, trying to reuse the same job id first, with `{ attempts: 3, backoff: 5000 }`.
-        7. Appends `{ state: 'resume-requested' }` and returns `{ status: 'resume-enqueued', newJobId }`.
+        3. Appends `{ state: 'stop-requested' }` to history and waits (short timeout) for the worker to append `stopped`.
+        4. Clears the stop key/marker after acknowledgement (or timeout).
+        5. Re-enqueues a new job (worker will perform the resume/merge work when it picks up the requeued job).
+        6. Appends `{ state: 'resume-requested' }` and returns `{ status: 'resume-enqueued', newJobId }`.
     - `POST /download/:id/cancel`
       - Records cancellation intent:
         - Writes `data/<id>.cancel` marker file.
-        - Attempts to `job.remove()`; if the job is active, worker will still see the cancel marker.
+        - Attempts to `job.remove()`; if the job is active, worker will still see the cancel marker and abort cooperatively.
         - Appends `{ state: 'cancelled' }` to history.
       - Returns `{ status: 'cancelled', id }`.
+      - Note: converting this to a Redis-based cancel key (`job:cancel:<id>`) is recommended for multi-host consistency and instant pub/sub notifications.
 
 - **`DownloadService`** (`src/download/download.service.ts`)
   - Very thin abstraction over Bull:
@@ -154,10 +154,11 @@
     - Writes to a `WriteStream` in append or write mode.
     - Logs progress (bytes and percent if content-length known).
     - On each chunk:
-      - If `cancelFilePath` exists → destroys stream with `"download cancelled"`.
-      - If `stopFileOrCheck` is:
-        - a **string**: existence of that file triggers `"download stopped"`.
-        - a **function**: when it returns true, triggers `"download stopped"`.
+        - If `cancelFilePath` exists → destroys stream with `"download cancelled"`.
+        - If `stopFileOrCheck` is:
+          - a **string**: existence of that file triggers `"download stopped"`.
+          - a **function**: when it returns true, triggers `"download stopped"`.
+    - The utility supports being driven by a worker-side `stopRequested()` function (preferred) or by filesystem markers (fallback).
 
 ### Data layout on disk
 
@@ -182,8 +183,9 @@
   - Redis key: `job:stop:<id>`.
   - Worker behavior:
     - Attempts to `duplicate()` the Bull client to create a pub/sub subscriber for `stopKey`.
-    - If pub/sub unavailable, falls back to polling `GET job:stop:<id>` every 250ms.
-    - Maintains an internal `stopRequested` flag that is passed to `resumeDownload` as a function.
+      - If pub/sub unavailable, falls back to polling `GET job:stop:<id>` every 250ms.
+      - Maintains an internal `stopRequested` flag that is passed to `resumeDownload` as a function.
+      - On stop acknowledgement the worker removes the key, unsubscribes the duplicate client and disconnects it (cleanup).
 - **Cancel signaling**:
   - No Redis; purely filesystem-based `data/<id>.cancel`.
   - Checked in worker and by `resumeDownload`.
@@ -232,4 +234,52 @@
   - `package.json` – scripts:
     - `start:dev`, `build`, `start:prod`, `start:worker`, `lint`.
   - `README.md` – docker-compose development flow and primary endpoints.
+
+  ### Running tests (in containers)
+
+  - This project uses `pnpm` and runs tests inside the `api` container so the container's `node_modules` and `pnpm` store stay consistent.
+  - To run the unit tests locally (recommended):
+
+  ```bash
+  docker compose up --build -d          # start services (redis, api, worker)
+  docker compose run --rm api pnpm test # run Jest inside the api container
+  ```
+
+  - If you prefer to run interactively and watch changes, start the API in dev mode:
+
+  ```bash
+  docker compose up --build -d
+  docker compose logs -f api
+  ```
+
+  Notes:
+  - If `pnpm` store mismatches occur after switching pnpm versions, use `docker compose down -v` and rebuild.
+  - Tests added under `test/` are TypeScript; `@jest/types` and `ts-jest` are configured in `package.json`.
+
+
+## Flow diagram
+
+```mermaid
+flowchart LR
+  Client[Client\n(HTTP request)] --> API[API / DownloadController]
+  API --> Queue[Bull queue: downloads]
+  API -->|SET `job:stop:<id>` / write stop marker| Redis[Redis (pub/sub & keys)]
+  API -->|write `data/<id>.cancel`| Disk[Disk (`data/`)]
+
+  Queue --> Worker[WorkerProcessor]
+  Redis -->|pub/sub or GET| Worker
+  Worker -->|calls| Resume[`resumeDownload()` util]
+  Resume -->|writes partials| Disk
+  Worker -->|on DASH: download segments| Disk
+  Worker -->|on merge| Ffmpeg[FfmpegService (merge)]
+  Ffmpeg -->|final file| Disk
+  Worker -->|append events| Jobs[JobHistory (`data/jobs/<id>.json`)]
+
+  API -->|requeue after stop| Queue
+
+  classDef infra fill:#f9f,stroke:#333,stroke-width:1px;
+  class Redis,Disk,Jobs infra;
+```
+
+This diagram shows the high-level message flow: the API enqueues jobs and signals stop/cancel via Redis or disk markers; the `WorkerProcessor` subscribes to Redis (or polls) and passes a `stopRequested()` function into `resumeDownload()` so downloads can abort cooperatively; after downloads finish the worker runs `FfmpegService.merge()` and records history in `data/jobs/`.
 
