@@ -1,13 +1,24 @@
 import * as fs from 'fs';
 import axios from 'axios';
+import * as crypto from 'crypto';
+
+export type StopCheckFn = () => boolean;
+export type ProgressCallback = (bytesDelta: number) => void;
+
+export interface ResumeDownloadResult {
+  bytes: number;
+  md5?: string;
+}
 
 export async function resumeDownload(
   url: string,
   dest: string,
   headers?: Record<string, string>,
   cancelFilePath?: string,
-  stopFileOrCheck?: string | (() => boolean),
-): Promise<void> {
+  stopFileOrCheck?: string | StopCheckFn,
+  onProgress?: ProgressCallback,
+  computeMd5: boolean = false,
+): Promise<ResumeDownloadResult> {
   const start = fs.existsSync(dest) ? fs.statSync(dest).size : 0;
   const reqHeaders: Record<string, string> = Object.assign({}, headers || {});
   if (start > 0) {
@@ -25,7 +36,7 @@ export async function resumeDownload(
   if (start > 0 && response.status === 200) {
     console.log(`[download] Server ignored Range; restarting ${dest}`);
     try { fs.unlinkSync(dest); } catch (e) { }
-    return resumeDownload(url, dest, headers);
+    return resumeDownload(url, dest, headers, cancelFilePath, stopFileOrCheck, onProgress, computeMd5);
   }
 
   const contentLength = parseInt(response.headers['content-length'] || '0', 10) || 0;
@@ -36,9 +47,24 @@ export async function resumeDownload(
   const writer = fs.createWriteStream(dest, { flags: start > 0 ? 'a' : 'w' });
   let received = start;
   let lastLog = Date.now();
+  const hash = computeMd5 ? crypto.createHash('md5') : null;
 
   response.data.on('data', (chunk: Buffer) => {
     received += chunk.length;
+    if (hash) {
+      try {
+        hash.update(chunk);
+      } catch (e) {
+        // ignore hash errors
+      }
+    }
+    if (onProgress) {
+      try {
+        onProgress(chunk.length);
+      } catch (e) {
+        // ignore progress callback errors
+      }
+    }
     const now = Date.now();
     // cooperative cancellation: if cancel file exists, abort the stream
     try {
@@ -91,6 +117,16 @@ export async function resumeDownload(
     writer.on('error', (err) => { error = err; try { writer.close(); } catch (e) { } ; reject(err); });
     writer.on('close', () => { if (!error) resolve(); else reject(error); });
   });
+
+  const result: ResumeDownloadResult = { bytes: received };
+  if (hash) {
+    try {
+      result.md5 = hash.digest('hex');
+    } catch (e) {
+      // ignore hash digest errors
+    }
+  }
+  return result;
 }
 
 export default resumeDownload;

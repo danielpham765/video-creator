@@ -8,7 +8,10 @@ import { FfmpegModule } from '../ffmpeg/ffmpeg.module';
 
 @Module({
   imports: [
-    BullModule.registerQueue({ name: 'downloads' }),
+    BullModule.registerQueue(
+      { name: 'downloads' },
+      { name: 'download-parts' },
+    ),
     JobsModule,
     PlayurlModule,
     FfmpegModule,

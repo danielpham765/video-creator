@@ -145,15 +145,28 @@
   - `POST /download/:id/resume` → `{ status: 'resume-enqueued', newJobId }`.
   - `POST /download/:id/cancel` → `{ status: 'cancelled', id }`.
 
-### Plans and future extensions
+### Parallel segmented downloads
 
-- **Parallel segmented downloads**
-  - Design document: `plan/PLAN_parallel_downloads.md`.
-  - Strategy:
-    - Prefer DASH/HLS segmentation when available.
-    - Use a master job that creates multiple part-subjobs (queue like `download-parts`).
-    - Workers download each part using `resumeDownload`.
-    - After all parts complete, a merge job combines segments (ffmpeg/MP4Box).
+- **Design document**: `plan/PLAN_parallel_downloads.md`.
+- **Queues**:
+  - `downloads` – master/orchestrator jobs.
+  - `download-parts` – byte-range part jobs.
+- **Current behavior**:
+  - For DASH (`play.data.dash`): existing single-stream video+audio download + ffmpeg merge is used.
+  - For large single-URL downloads (`play.data.durl[0].url`) that support `Accept-Ranges: bytes`:
+    - Master job performs a HEAD request to discover `content-length`.
+    - If the file is large enough (at least ~2× 8MB), it:
+      - Builds a manifest of ~8MB byte ranges.
+      - Persists the manifest to `data/<jobId>/manifest.json` and to Redis under `job:parts:<jobId>`.
+      - Enqueues one Bull job per part into `download-parts`.
+    - `PartsProcessor` downloads each byte-range into `data/<jobId>/parts/part-<index>.bin` using `resumeDownload(onProgress)`.
+    - The master polls part jobs every 5s, detects stalls after ~15s of no progress, and can mark the whole job as failed.
+    - When all parts complete, the master merges the part files into a single output `.mp4`.
+- **Endpoints**:
+  - `GET /download/status/:id` – still the main status endpoint; future work may expose more part-level detail from Redis.
+  - `POST /download/:id/merge-partial` – planned for best-effort partial merge based on completed parts (see plan doc).
+
+### Other plans
 
 - **Original NestJS project plan**
   - Document: `plan/PLAN_nestjs.md`.
