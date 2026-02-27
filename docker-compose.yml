@@ -26,11 +26,12 @@ services:
     build:
       context: .
       target: dev
-    command: node dist/worker.js
+    command: pnpm run start:dev
     depends_on:
       - redis
     environment:
       - NODE_ENV=development
+      - WORKER=true
     deploy:
       replicas: 2
     volumes:

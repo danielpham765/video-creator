@@ -144,18 +144,14 @@ export class DownloadController {
       try { const f = path.join(DATA_DIR, `${id}.stop`); if (fs.existsSync(f)) fs.unlinkSync(f); } catch (e) { }
     }
 
-    // requeue the job for the worker to perform the resume; try to reuse same job id
+    // Requeue as a fresh job id so Bull always creates executable work.
+    // Reusing an existing failed job id can return the old job record without re-processing.
     let newJob: any = null;
       try {
         await this.history.appendEvent(id, { state: 'requeueing', progress: 0 });
         const retryCount = Number(this.config.get('download.retryCount') ?? 3);
         const retryBackoffMs = Number(this.config.get('download.retryBackoffMs') ?? 5000);
-        try {
-          newJob = await this.downloadQueue.add(data, { jobId: id, attempts: retryCount, backoff: retryBackoffMs });
-        } catch (e) {
-          // if adding with same id fails, add as a fresh job
-          newJob = await this.downloadQueue.add(data, { attempts: retryCount, backoff: retryBackoffMs });
-        }
+        newJob = await this.downloadQueue.add(data, { attempts: retryCount, backoff: retryBackoffMs });
         await this.history.appendEvent(id, { state: 'resume-requested', progress: 1 });
       } catch (e) {
       await this.history.appendEvent(id, { state: 'requeue-failed', progress: 0, message: String(e?.message || e) });

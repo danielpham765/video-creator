@@ -44,9 +44,28 @@ export class PartsProcessor {
     const partName = role === 'audio' ? `audio-part-${partIndex}.bin` : `part-${partIndex}.bin`;
     const partPath = path.join(partsDir, partName);
 
-    // For now, parts are not resumable: start from scratch if file exists.
+    // If a previous attempt already produced a complete part file, treat this as idempotent success.
+    // This avoids duplicate retry jobs truncating valid part outputs.
     try {
-      if (fs.existsSync(partPath)) fs.unlinkSync(partPath);
+      if (fs.existsSync(partPath)) {
+        const existingSize = fs.statSync(partPath).size;
+        if (typeof expectedBytes === 'number' && expectedBytes > 0 && existingSize === expectedBytes) {
+          this.logger.log(`Job ${jobId} part ${partIndex}: reusing existing part (${existingSize} bytes)`);
+          const redisClient: any = (this.partsQueue && (this.partsQueue as any).client) ? (this.partsQueue as any).client : null;
+          if (redisClient) {
+            try {
+              const key = `job:parts:${jobId}`;
+              const fieldPrefix = role === 'audio' ? `part:audio:${partIndex}` : `part:${partIndex}`;
+              await redisClient.hset(key, `${fieldPrefix}:state`, 'completed');
+              await redisClient.hset(key, `${fieldPrefix}:expectedBytes`, String(expectedBytes));
+              await redisClient.hset(key, `${fieldPrefix}:downloadedBytes`, String(existingSize));
+            } catch (e) {}
+          }
+          await job.progress(100).catch(() => undefined);
+          return { jobId, bvid, partIndex, path: partPath, bytes: existingSize, expectedBytes };
+        }
+        fs.unlinkSync(partPath);
+      }
     } catch (e) {
       // ignore
     }
@@ -146,6 +165,11 @@ export class PartsProcessor {
     if (!this.config.get('download.resumeEnabled')) {
       try { if (fs.existsSync(partPath)) fs.unlinkSync(partPath); } catch (e) {}
     }
+    // Ensure byte-range jobs request only their assigned slice.
+    if (typeof rangeStart === 'number' && typeof rangeEnd === 'number') {
+      reqHeaders.Range = `bytes=${rangeStart}-${rangeEnd}`;
+    }
+
     const result: ResumeDownloadResult = await resumeDownload(
       url!,
       partPath,
@@ -165,6 +189,11 @@ export class PartsProcessor {
     const finalSize = fs.existsSync(partPath) ? fs.statSync(partPath).size : 0;
     if (finalSize <= 0) {
       throw new Error(`Part ${partIndex} of job ${jobId} produced empty file`);
+    }
+    if (typeof expectedBytes === 'number' && expectedBytes > 0 && finalSize !== expectedBytes) {
+      throw new Error(
+        `Part ${partIndex} of job ${jobId} size mismatch: got ${finalSize}, expected ${expectedBytes}. Range may be ignored by origin.`,
+      );
     }
 
     // Mark part as completed in Redis (state + expectedBytes) for consumers that track per-part status.
@@ -192,4 +221,3 @@ export class PartsProcessor {
     };
   }
 }
-

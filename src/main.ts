@@ -3,11 +3,14 @@ import { NestFactory } from '@nestjs/core';
 import { DocumentBuilder, SwaggerModule } from '@nestjs/swagger';
 import { AppModule } from './app.module';
 import { LoggingInterceptor } from './common/logging.interceptor';
+import { FileLoggerService } from './common/file-logger.service';
 
 async function bootstrap() {
   // Support dynamic AppModule.register() when AppModule is a dynamic module
   const bootstrapModule: any = (AppModule as any)?.register ? (AppModule as any).register() : AppModule;
-  const app = await NestFactory.create(bootstrapModule);
+  const logger = new FileLoggerService();
+  const app = await NestFactory.create(bootstrapModule, { logger });
+  app.useLogger(logger);
 
   // Enable runtime validation and auto-transformation for DTOs
   app.useGlobalPipes(new ValidationPipe({ whitelist: true, transform: true }));
@@ -24,8 +27,7 @@ async function bootstrap() {
 
   const port = process.env.PORT || 3000;
   await app.listen(port);
-  // eslint-disable-next-line no-console
-  console.log(`Application listening on port ${port}`);
+  logger.log(`Application listening on port ${port}`, 'Bootstrap');
 }
 
 bootstrap();

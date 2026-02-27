@@ -34,7 +34,7 @@ download:
   # ENV: DOWNLOAD_DEFAULT_STRATEGY
   defaultStrategy: auto
   # Max concurrent part downloads per process (ENV: MAX_CONCURRENT_DOWNLOADS)
-  maxConcurrentDownloads: 100
+  maxConcurrentDownloads: 10
   # Retry attempts for transient failures (ENV: DOWNLOAD_RETRY_COUNT)
   retryCount: 3
   # Toggle resumable downloads on/off (ENV: RESUME_DOWNLOAD_ENABLED)
@@ -55,6 +55,40 @@ proxy:
 logging:
   # ENV: LOG_LEVEL (e.g. debug, info, warn, error)
   level: debug
+  rotate:
+    # Enable/disable log rotation (ENV: LOG_ROTATE_ENABLED)
+    enabled: true
+    # Rotate when any managed log file reaches this size in MB (ENV: LOG_ROTATE_MAX_FILE_SIZE_MB)
+    maxFileSizeMb: 5
+    # Minimum interval between rotate checks in milliseconds (ENV: LOG_ROTATE_CHECK_INTERVAL_MS)
+    checkIntervalMs: 5000
+    # Archive destination: local | s3 (ENV: LOG_ROTATE_DESTINATION)
+    destination: local
+    local:
+      # Local archive retention by max number of zip files (ENV: LOG_ROTATE_LOCAL_MAX_FILES)
+      maxFiles: 20
+      # Optional retention by days; 0 means disabled (ENV: LOG_ROTATE_LOCAL_RETENTION_DAYS)
+      retentionDays: 0
+    s3:
+      # Required when destination=s3 (ENV: LOG_ROTATE_S3_BUCKET)
+      bucket: ""
+      # ENV: LOG_ROTATE_S3_REGION
+      region: ap-southeast-1
+      # ENV: LOG_ROTATE_S3_PREFIX
+      prefix: logs/archived
+      # Optional custom endpoint for S3-compatible services (ENV: LOG_ROTATE_S3_ENDPOINT)
+      endpoint: ""
+      # ENV: LOG_ROTATE_S3_FORCE_PATH_STYLE
+      forcePathStyle: false
+      # Optional static credentials. If empty, SDK default credential chain is used.
+      # ENV: LOG_ROTATE_S3_ACCESS_KEY_ID
+      accessKeyId: ""
+      # ENV: LOG_ROTATE_S3_SECRET_ACCESS_KEY
+      secretAccessKey: ""
+      # ENV: LOG_ROTATE_S3_SESSION_TOKEN
+      sessionToken: ""
+      # Default retention for S3 archives in days (ENV: LOG_ROTATE_S3_RETENTION_DAYS)
+      retentionDays: 30
 
 app:
   # Interval (ms) for Bull stalled-check housekeeping (ENV: BULL_STALLED_CHECK_INTERVAL_MS)
