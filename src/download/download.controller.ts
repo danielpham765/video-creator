@@ -1,8 +1,9 @@
-import { Body, Controller, Get, NotFoundException, Param, Post } from '@nestjs/common';
+import { Body, Controller, Get, NotFoundException, Param, Post, BadRequestException } from '@nestjs/common';
 import { InjectQueue } from '@nestjs/bull';
 import { Queue } from 'bull';
 import { DownloadService } from './download.service';
 import { JobHistoryService } from '../jobs/job-history.service';
+import { FfmpegService } from '../ffmpeg/ffmpeg.service';
 
 import * as path from 'path';
 import * as fs from 'fs';
@@ -13,6 +14,7 @@ export class DownloadController {
     private readonly downloadService: DownloadService,
     @InjectQueue('downloads') private readonly downloadQueue: Queue,
     private readonly history: JobHistoryService,
+    private readonly ffmpeg: FfmpegService,
   ) {}
 
   @Post()
@@ -124,5 +126,114 @@ export class DownloadController {
 
     try { await this.history.appendEvent(id, { state: 'cancelled', progress: 0 }); } catch (e) { }
     return { status: 'cancelled', id };
+  }
+
+  @Post(':id/merge-partial')
+  async mergePartial(@Param('id') id: string) {
+    const jobId = String(id);
+    const DATA_DIR = path.resolve(process.cwd(), 'data');
+    const manifestDir = path.join(DATA_DIR, jobId);
+    const manifestPath = path.join(manifestDir, 'manifest.json');
+    if (!fs.existsSync(manifestPath)) {
+      throw new NotFoundException('manifest not found for job');
+    }
+
+    let manifest: any;
+    try {
+      const raw = await fs.promises.readFile(manifestPath, 'utf8');
+      manifest = JSON.parse(raw || '{}');
+    } catch (e) {
+      throw new BadRequestException('invalid manifest for job');
+    }
+
+    const bvid: string = manifest?.bvid;
+    if (!bvid) throw new BadRequestException('manifest missing bvid');
+
+    const title: string = manifest?.title || bvid;
+    const safeTitle = this.sanitizeTitle(title);
+
+    // Currently partial merge is only meaningful for byte-range (durl) strategy.
+    if (manifest?.strategy !== 'durl-byte-range') {
+      throw new BadRequestException('partial merge is only supported for byte-range downloads');
+    }
+
+    const partsDir = path.join(manifestDir, 'parts');
+    if (!fs.existsSync(partsDir)) {
+      throw new BadRequestException('no parts directory for job');
+    }
+
+    const parts: any[] = Array.isArray(manifest.parts) ? manifest.parts : [];
+    if (!parts.length) throw new BadRequestException('manifest has no parts');
+
+    // Determine largest contiguous prefix of parts [0..k] that have existing files.
+    let prefixCount = 0;
+    for (let i = 0; i < parts.length; i++) {
+      const partPath = path.join(partsDir, `part-${i}.bin`);
+      if (!fs.existsSync(partPath)) break;
+      prefixCount++;
+    }
+
+    if (prefixCount === 0) {
+      await this.history.appendEvent(jobId, { state: 'partial-merge-not-possible', progress: 0 });
+      throw new BadRequestException('no completed parts to merge');
+    }
+
+    const partialTmp = path.join(DATA_DIR, `${jobId}-partial-temp.mp4`);
+    try {
+      if (fs.existsSync(partialTmp)) fs.unlinkSync(partialTmp);
+    } catch (e) {
+      // ignore
+    }
+
+    // Concatenate prefix part files into a temporary partial file.
+    const outStream = fs.createWriteStream(partialTmp, { flags: 'w' });
+    for (let i = 0; i < prefixCount; i++) {
+      const partPath = path.join(partsDir, `part-${i}.bin`);
+      await new Promise<void>((resolve, reject) => {
+        const rs = fs.createReadStream(partPath);
+        rs.on('error', reject);
+        rs.on('end', () => resolve());
+        rs.pipe(outStream, { end: false });
+      });
+    }
+    outStream.end();
+
+    const finalDir = path.join(DATA_DIR, 'bilibili', safeTitle);
+    try {
+      if (!fs.existsSync(finalDir)) fs.mkdirSync(finalDir, { recursive: true });
+    } catch (e) {
+      // ignore
+    }
+    const finalPath = fs.existsSync(finalDir)
+      ? path.join(finalDir, `${bvid}-${jobId}-partial.mp4`)
+      : partialTmp;
+    if (finalPath !== partialTmp) {
+      try {
+        fs.renameSync(partialTmp, finalPath);
+      } catch (e) {
+        // fall back to temp location if rename fails
+      }
+    }
+
+    await this.history.appendEvent(jobId, {
+      state: 'partial-merged',
+      progress: 100,
+      result: {
+        path: finalPath,
+        bvid,
+        title,
+        mergedParts: prefixCount,
+        totalParts: parts.length,
+      },
+    });
+
+    return { status: 'partial-merged', id: jobId, path: finalPath, mergedParts: prefixCount, totalParts: parts.length };
+  }
+
+  private sanitizeTitle(raw: string): string {
+    const trimmed = (raw || '').trim();
+    const noSpecials = trimmed.replace(/[\/\\:*?"<>|]/g, '');
+    const collapsed = noSpecials.replace(/\s+/g, ' ');
+    return collapsed.substring(0, 80) || 'untitled';
   }
 }
