@@ -95,8 +95,11 @@ export class PartsProcessor {
           const segUrl = segmentUrls[si];
           const segTmp = path.join(partsDir, `${role === 'audio' ? 'audio-part' : 'part'}-${partIndex}-seg-${si}.tmp`);
           // download each segment into a tmp file
-          try {
+            try {
             this.logger.debug(`Downloading segment ${si} for job ${jobId} part ${partIndex}: ${segUrl}`);
+            if (!this.config.get('download.resumeEnabled')) {
+              try { if (fs.existsSync(segTmp)) fs.unlinkSync(segTmp); } catch (e) {}
+            }
             await resumeDownload(segUrl, segTmp, reqHeaders, path.join(this['dataDir'], `${jobId}.cancel`), undefined, onProgress, false, {
               timeoutMs: Number(this.config.get('download.timeoutMs') ?? 30000),
               proxy: String(this.config.get('proxy.http') || this.config.get('proxy.https') || '' ) || undefined,
@@ -137,6 +140,9 @@ export class PartsProcessor {
     this.logger.log(`Job ${jobId} part ${partIndex}: downloading bytes ${rangeStart}-${rangeEnd}`);
     this.logger.debug(`Byte-range download headers: ${JSON.stringify(reqHeaders)}`);
     const cancelFile = path.join(this['dataDir'], `${jobId}.cancel`);
+    if (!this.config.get('download.resumeEnabled')) {
+      try { if (fs.existsSync(partPath)) fs.unlinkSync(partPath); } catch (e) {}
+    }
     const result: ResumeDownloadResult = await resumeDownload(
       url!,
       partPath,

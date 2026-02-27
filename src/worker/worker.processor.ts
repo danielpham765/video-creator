@@ -66,6 +66,9 @@ export class WorkerProcessor {
       const downloadTimeoutMs = Number(this.config.get('download.timeoutMs') ?? 30000);
       const proxyUrl = String(this.config.get('proxy.http') || this.config.get('proxy.https') || '');
       const downloadOptions = { timeoutMs: downloadTimeoutMs, proxy: proxyUrl || undefined };
+      const retryCount = Number(this.config.get('download.retryCount') ?? 3);
+      const retryBackoffMs = Number(this.config.get('download.retryBackoffMs') ?? 5000);
+      const resumeEnabled = Boolean(this.config.get('download.resumeEnabled') ?? true);
 
       const cancelFile = path.join(this['dataDir'], `${job.id}.cancel`);
       const stopFile = path.join(this['dataDir'], `${job.id}.stop`);
@@ -212,7 +215,7 @@ export class WorkerProcessor {
           const partJobs: Job[] = [];
           for (const p of parts) {
             this.logger.debug(`Enqueue video part job=${job.id} part=${p.partIndex} expectedBytes=${p.expectedBytes}`);
-            const j = await this.partsQueue!.add({ jobId: String(job.id), bvid, segmentUrls: p.segmentUrls, partIndex: p.partIndex, expectedBytes: p.expectedBytes || 0, headers, role: 'video' } as any, { attempts: 3, backoff: 5000 });
+            const j = await this.partsQueue!.add({ jobId: String(job.id), bvid, segmentUrls: p.segmentUrls, partIndex: p.partIndex, expectedBytes: p.expectedBytes || 0, headers, role: 'video' } as any, { attempts: retryCount, backoff: retryBackoffMs });
             partJobs.push(j);
           }
 
@@ -229,7 +232,7 @@ export class WorkerProcessor {
             }
             for (const p of audioParts) {
               this.logger.debug(`Enqueue audio part job=${job.id} part=${p.partIndex} expectedBytes=${p.expectedBytes}`);
-              const j = await this.partsQueue!.add({ jobId: String(job.id), bvid, segmentUrls: p.segmentUrls, partIndex: p.partIndex, expectedBytes: p.expectedBytes || 0, headers, role: 'audio' } as any, { attempts: 3, backoff: 5000 });
+              const j = await this.partsQueue!.add({ jobId: String(job.id), bvid, segmentUrls: p.segmentUrls, partIndex: p.partIndex, expectedBytes: p.expectedBytes || 0, headers, role: 'audio' } as any, { attempts: retryCount, backoff: retryBackoffMs });
               audioPartJobs.push(j);
             }
           }
@@ -282,9 +285,12 @@ export class WorkerProcessor {
           if (!audioConcatTmp) {
             await job.progress(85);
             await this.history.appendEvent(job.id.toString(), { state: 'downloading-audio', progress: 85 });
-            try {
-              await resumeDownload(audioUrl, audioTmp, { Referer: `https://www.bilibili.com/video/${bvid}`, Cookie: cookies }, cancelFile, () => stopRequested || cancelRequested, undefined, false, downloadOptions);
-            } catch (err: any) {
+              try {
+                if (!resumeEnabled && fs.existsSync(audioTmp)) {
+                  try { fs.unlinkSync(audioTmp); } catch (e) {}
+                }
+                await resumeDownload(audioUrl, audioTmp, { Referer: `https://www.bilibili.com/video/${bvid}`, Cookie: cookies }, cancelFile, () => stopRequested || cancelRequested, undefined, false, downloadOptions);
+              } catch (err: any) {
               if (String(err?.message || '').toLowerCase().includes('stopped')) { await this.history.appendEvent(job.id.toString(), { state: 'stopped', progress: 0 }); this.logger.log(`Job ${job.id} stopped during audio download`); try { if (redisClient) await redisClient.del(stopKey); } catch (e) {} if (_poll) clearInterval(_poll); return { stopped: true }; }
               throw err;
             }
@@ -302,7 +308,8 @@ export class WorkerProcessor {
         // fallback: if we didn't do segmented path, download whole video+audio as before
         if (!didSegment) {
           if (fs.existsSync(cancelFile) || cancelRequested) { await this.history.appendEvent(job.id.toString(), { state: 'cancelled', progress: 0 }); this.logger.log(`Job ${job.id} cancelled before download start`); return { cancelled: true }; }
-          try {
+            try {
+            if (!resumeEnabled && fs.existsSync(videoTmp)) { try { fs.unlinkSync(videoTmp); } catch (e) {} }
             await resumeDownload(videoUrl, videoTmp, { Referer: `https://www.bilibili.com/video/${bvid}`, Cookie: cookies }, cancelFile, () => stopRequested || cancelRequested, undefined, false, downloadOptions);
           } catch (err: any) {
             if (String(err?.message || '').toLowerCase().includes('stopped')) { await this.history.appendEvent(job.id.toString(), { state: 'stopped', progress: 0 }); this.logger.log(`Job ${job.id} stopped during video download`); try { if (redisClient) await redisClient.del(stopKey); } catch (e) {} if (_poll) clearInterval(_poll); try { if (subClient) { if (typeof subClient.unsubscribe === 'function') { try { await subClient.unsubscribe(stopKey); } catch {} try { await subClient.unsubscribe(cancelKey); } catch {} } if (typeof subClient.disconnect === 'function') await subClient.disconnect(); if (typeof subClient.quit === 'function') await subClient.quit(); } } catch (e) {} return { stopped: true }; }
@@ -310,7 +317,7 @@ export class WorkerProcessor {
           }
           await job.progress(50);
           await this.history.appendEvent(job.id.toString(), { state: 'downloading-audio', progress: 50 });
-            try { await resumeDownload(audioUrl, audioTmp, { Referer: `https://www.bilibili.com/video/${bvid}`, Cookie: cookies }, cancelFile, () => stopRequested || cancelRequested, undefined, false, downloadOptions); } catch (err: any) { if (String(err?.message || '').toLowerCase().includes('stopped')) { await this.history.appendEvent(job.id.toString(), { state: 'stopped', progress: 0 }); this.logger.log(`Job ${job.id} stopped during audio download`); try { if (redisClient) await redisClient.del(stopKey); } catch (e) {} if (_poll) clearInterval(_poll); return { stopped: true }; } throw err; }
+            try { if (!resumeEnabled && fs.existsSync(audioTmp)) { try { fs.unlinkSync(audioTmp); } catch (e) {} } await resumeDownload(audioUrl, audioTmp, { Referer: `https://www.bilibili.com/video/${bvid}`, Cookie: cookies }, cancelFile, () => stopRequested || cancelRequested, undefined, false, downloadOptions); } catch (err: any) { if (String(err?.message || '').toLowerCase().includes('stopped')) { await this.history.appendEvent(job.id.toString(), { state: 'stopped', progress: 0 }); this.logger.log(`Job ${job.id} stopped during audio download`); try { if (redisClient) await redisClient.del(stopKey); } catch (e) {} if (_poll) clearInterval(_poll); return { stopped: true }; } throw err; }
           await job.progress(70);
           await this.history.appendEvent(job.id.toString(), { state: 'merging', progress: 70 });
           await this.ffmpeg.merge(videoTmp, audioTmp, tempOutFile);
@@ -362,7 +369,7 @@ export class WorkerProcessor {
           await this.history.appendEvent(job.id.toString(), { state: 'segmenting', progress: 35, manifestPath });
           const headers = { Referer: `https://www.bilibili.com/video/${bvid}`, Cookie: cookies || '' };
           const partJobs = [];
-          for (const p of parts) { this.logger.debug(`Enqueue byte-range part job=${job.id} part=${p.partIndex} range=${p.rangeStart}-${p.rangeEnd} expected=${p.expectedBytes}`); const j = await this.partsQueue!.add({ jobId: String(job.id), bvid, url, partIndex: p.partIndex, rangeStart: p.rangeStart, rangeEnd: p.rangeEnd, expectedBytes: p.expectedBytes, headers } as any, { attempts: 3, backoff: 5000 }); partJobs.push(j); }
+          for (const p of parts) { this.logger.debug(`Enqueue byte-range part job=${job.id} part=${p.partIndex} range=${p.rangeStart}-${p.rangeEnd} expected=${p.expectedBytes}`); const j = await this.partsQueue!.add({ jobId: String(job.id), bvid, url, partIndex: p.partIndex, rangeStart: p.rangeStart, rangeEnd: p.rangeEnd, expectedBytes: p.expectedBytes, headers } as any, { attempts: retryCount, backoff: retryBackoffMs }); partJobs.push(j); }
           const stallMs = 15000; const pollMs = 5000; const lastProgress: Record<string, { value: number; ts: number }> = {}; let remaining = partJobs.length; while (remaining > 0) { remaining = 0; for (const pj of partJobs) { const id = String(pj.id); const state = await pj.getState(); const prog = (await pj.progress()) as number; if (state === 'completed') continue; if (state === 'failed') throw new Error(`Part job ${id} failed`); remaining += 1; const now = Date.now(); const prev = lastProgress[id]; if (!prev || prog > prev.value) lastProgress[id] = { value: prog, ts: now }; else if (now - prev.ts >= stallMs) { await this.history.appendEvent(job.id.toString(), { state: 'failed', progress: 0, message: `Part job ${id} stalled at ${prog}%`, }); throw new Error(`Part job ${id} stalled`); } } if (remaining > 0) await new Promise((r) => setTimeout(r, pollMs)); }
           await this.history.appendEvent(job.id.toString(), { state: 'merging-parts', progress: 80 });
           const outStream = fs.createWriteStream(tempOutFile, { flags: 'w' });
