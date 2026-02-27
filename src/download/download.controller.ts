@@ -2,6 +2,8 @@ import { Body, Controller, Get, NotFoundException, Param, Post, BadRequestExcept
 import { InjectQueue } from '@nestjs/bull';
 import { Queue } from 'bull';
 import { DownloadService } from './download.service';
+import { CreateDownloadDto } from './dto/create-download.dto';
+import { ApiBody } from '@nestjs/swagger';
 import { JobHistoryService } from '../jobs/job-history.service';
 import { FfmpegService } from '../ffmpeg/ffmpeg.service';
 import { ConfigService } from '@nestjs/config';
@@ -20,8 +22,26 @@ export class DownloadController {
   ) {}
 
   @Post()
-  async startDownload(@Body() body: any) {
-    const job = await this.downloadService.enqueue(body);
+  @ApiBody({ type: CreateDownloadDto })
+  async startDownload(@Body() payload: CreateDownloadDto) {
+    // Normalize incoming body: accept either a `bvid` already, or a `url` containing a BV id.
+    let bvid: string | undefined = (payload as any).bvid;
+    if (!bvid && payload.url) {
+      const u = String(payload.url || '');
+      // try to find BV id in common Bilibili URL forms
+      const m1 = u.match(/BV[0-9A-Za-z]+/);
+      const m2 = u.match(/[?&]bvid=(BV[0-9A-Za-z]+)/);
+      if (m1) bvid = m1[0];
+      else if (m2) bvid = m2[1];
+    }
+
+    if (!bvid) {
+      // If caller didn't provide a bvid or a url containing one, reject the request
+      throw new BadRequestException('bvid missing from request; provide a Bilibili video URL or bvid');
+    }
+
+    const jobPayload: any = { bvid, url: payload.url, title: payload.title };
+    const job = await this.downloadService.enqueue(jobPayload);
     return { jobId: job.id };
   }
 
@@ -47,7 +67,7 @@ export class DownloadController {
           let totalExpected = 0;
           let totalDownloaded = 0;
           Object.keys(raw).forEach((k) => {
-            const m = k.match(/^part:(\d+):(expectedBytes|downloadedBytes|state)$/);
+            const m = k.match(/^part(?::audio)?:?(\d+):(expectedBytes|downloadedBytes|state)$/);
             if (m) {
               const idx = parseInt(m[1], 10);
               const field = m[2];

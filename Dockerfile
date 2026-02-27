@@ -3,11 +3,11 @@ WORKDIR /usr/src/app
 COPY package.json pnpm-lock.yaml* ./
 RUN corepack enable && corepack prepare pnpm@latest --activate
 # allow install when pnpm-lock.yaml is not present in dev environment
-RUN pnpm install --no-frozen-lockfile --prod
+RUN pnpm install --no-frozen-lockfile
 
 FROM base AS dev
 COPY . .
-RUN pnpm install
+RUN pnpm install --no-frozen-lockfile
 RUN apt-get update && apt-get install -y ffmpeg ca-certificates procps && rm -rf /var/lib/apt/lists/*
 CMD ["pnpm", "run", "start:dev"]
 

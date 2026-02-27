@@ -53,6 +53,8 @@ export class PartsProcessor {
 
     const reqHeaders: Record<string, string> = Object.assign({}, headers || {});
 
+    const fieldPrefix = role === 'audio' ? `part:audio:${partIndex}` : `part:${partIndex}`;
+
     const redisClient: any =
       (this.partsQueue && (this.partsQueue as any).client) ? (this.partsQueue as any).client : null;
 
@@ -78,7 +80,7 @@ export class PartsProcessor {
           const key = `job:parts:${jobId}`;
           // Store downloaded bytes; callers can also read expectedBytes/state from Redis.
           redisClient
-            .hset(key, `part:${partIndex}:downloadedBytes`, String(downloaded))
+            .hset(key, `${fieldPrefix}:downloadedBytes`, String(downloaded))
             .catch(() => undefined);
         } catch (e) {
           // ignore redis errors
@@ -103,6 +105,7 @@ export class PartsProcessor {
             await resumeDownload(segUrl, segTmp, reqHeaders, path.join(this['dataDir'], `${jobId}.cancel`), undefined, onProgress, false, {
               timeoutMs: Number(this.config.get('download.timeoutMs') ?? 30000),
               proxy: String(this.config.get('proxy.http') || this.config.get('proxy.https') || '' ) || undefined,
+              logger: this.logger,
             });
           } catch (e) {
             try { if (fs.existsSync(segTmp)) fs.unlinkSync(segTmp); } catch (er) {}
@@ -154,6 +157,7 @@ export class PartsProcessor {
       {
         timeoutMs: Number(this.config.get('download.timeoutMs') ?? 30000),
         proxy: String(this.config.get('proxy.http') || this.config.get('proxy.https') || '') || undefined,
+        logger: this.logger,
       },
     );
 

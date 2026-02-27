@@ -18,18 +18,18 @@ export async function resumeDownload(
   stopFileOrCheck?: string | StopCheckFn,
   onProgress?: ProgressCallback,
   computeMd5: boolean = false,
-  options?: { timeoutMs?: number; proxy?: string },
+  options?: { timeoutMs?: number; proxy?: string; logger?: { debug?: (...args: any[]) => void; log?: (...args: any[]) => void } },
 ): Promise<ResumeDownloadResult> {
   const start = fs.existsSync(dest) ? fs.statSync(dest).size : 0;
   const reqHeaders: Record<string, string> = Object.assign({}, headers || {});
   if (start > 0) {
     reqHeaders.Range = `bytes=${start}-`;
-    console.log(`[download] Resuming ${dest} from ${start}`);
+    try { (options?.logger?.log ?? console.log)(`[download] Resuming ${dest} from ${start}`); } catch (e) {}
   }
 
   // debug: print what we're about to request
   try {
-    console.debug && console.debug(`[download] request ${url} -> ${dest} headers=${JSON.stringify(reqHeaders)}`);
+    (options?.logger?.debug ?? console.debug)(`[download] request ${url} -> ${dest} headers=${JSON.stringify(reqHeaders)}`);
   } catch (e) {}
 
   // Allow overriding timeout and proxy via options (backwards-compatible)
@@ -53,11 +53,11 @@ export async function resumeDownload(
   const response = await axios.get(url, axiosConfig);
 
   try {
-    console.debug && console.debug(`[download] response status=${response.status} content-length=${response.headers['content-length'] || 'unknown'}`);
+    (options?.logger?.debug ?? console.debug)(`[download] response status=${response.status} content-length=${response.headers['content-length'] || 'unknown'}`);
   } catch (e) {}
 
-  if (start > 0 && response.status === 200) {
-    console.log(`[download] Server ignored Range; restarting ${dest}`);
+    if (start > 0 && response.status === 200) {
+    try { (options?.logger?.log ?? console.log)(`[download] Server ignored Range; restarting ${dest}`); } catch (e) {}
     try { fs.unlinkSync(dest); } catch (e) { }
     return resumeDownload(url, dest, headers, cancelFilePath, stopFileOrCheck, onProgress, computeMd5, options);
   }
@@ -95,7 +95,7 @@ export async function resumeDownload(
         const err = new Error('download cancelled');
         response.data.destroy(err);
         try { writer.close(); } catch (e) { }
-        try { console.debug && console.debug(`[download] cancelled via cancelFile=${cancelFilePath}`); } catch (e) {}
+        try { (options?.logger?.debug ?? console.debug)(`[download] cancelled via cancelFile=${cancelFilePath}`); } catch (e) {}
         return;
       }
       // support either a stop-file path or a stop-check function
@@ -105,7 +105,7 @@ export async function resumeDownload(
             const err = new Error('download stopped');
             response.data.destroy(err);
             try { writer.close(); } catch (e) { }
-            try { console.debug && console.debug(`[download] stopped via stopFile=${stopFileOrCheck}`); } catch (e) {}
+            try { (options?.logger?.debug ?? console.debug)(`[download] stopped via stopFile=${stopFileOrCheck}`); } catch (e) {}
             return;
           }
         } else if (typeof stopFileOrCheck === 'function') {
@@ -114,7 +114,7 @@ export async function resumeDownload(
               const err = new Error('download stopped');
               response.data.destroy(err);
               try { writer.close(); } catch (e) { }
-              try { console.debug && console.debug(`[download] stopped via stop-check function for ${dest}`); } catch (e) {}
+              try { (options?.logger?.debug ?? console.debug)(`[download] stopped via stop-check function for ${dest}`); } catch (e) {}
               return;
             }
           } catch (e) {
@@ -126,12 +126,14 @@ export async function resumeDownload(
       // ignore fs errors
     }
     if (now - lastLog > 1000) {
-      if (total) {
-        const pct = ((received / total) * 100).toFixed(1);
-        console.log(`[download] ${dest} received ${received}/${total} bytes (${pct}%)`);
-      } else {
-        console.log(`[download] ${dest} received ${received} bytes`);
-      }
+      try {
+        if (total) {
+          const pct = ((received / total) * 100).toFixed(1);
+          (options?.logger?.debug ?? console.log)(`[download] ${dest} received ${received}/${total} bytes (${pct}%)`);
+        } else {
+          (options?.logger?.debug ?? console.log)(`[download] ${dest} received ${received} bytes`);
+        }
+      } catch (e) {}
       lastLog = now;
     }
   });

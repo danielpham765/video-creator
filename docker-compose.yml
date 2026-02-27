@@ -1,4 +1,3 @@
-version: '3.8'
 services:
   redis:
     image: redis:7
@@ -32,10 +31,11 @@ services:
       - redis
     environment:
       - NODE_ENV=development
+    deploy:
+      replicas: 2
     volumes:
       - ./:/usr/src/app:cached
       - /usr/src/app/node_modules
 
 volumes:
-  node_modules: {}
   redis-data: {}

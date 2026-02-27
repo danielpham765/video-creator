@@ -29,6 +29,10 @@ download:
   # Size per part when splitting (in megabytes). Default: 8 (ENV: PART_SIZE_BYTES)
   # Note: application should interpret this value as MB and convert to bytes.
   partSizeBytes: 8
+  # Default download strategy when automatic detection is ambiguous.
+  # Allowed: auto | dash-single | dash-segmented | durl-byte-range
+  # ENV: DOWNLOAD_DEFAULT_STRATEGY
+  defaultStrategy: auto
   # Max concurrent part downloads per process (ENV: MAX_CONCURRENT_DOWNLOADS)
   maxConcurrentDownloads: 100
   # Retry attempts for transient failures (ENV: DOWNLOAD_RETRY_COUNT)
