@@ -16,6 +16,7 @@ export class DownloadController {
   constructor(
     private readonly downloadService: DownloadService,
     @InjectQueue('downloads') private readonly downloadQueue: Queue,
+    @InjectQueue('download-parts') private readonly partsQueue: Queue,
     private readonly history: JobHistoryService,
     private readonly ffmpeg: FfmpegService,
     private readonly config: ConfigService,
@@ -26,13 +27,24 @@ export class DownloadController {
   async startDownload(@Body() payload: CreateDownloadDto) {
     // Normalize incoming body: accept either a `bvid` already, or a `url` containing a BV id.
     let bvid: string | undefined = (payload as any).bvid;
+    let page = 1;
     if (!bvid && payload.url) {
       const u = String(payload.url || '');
       // try to find BV id in common Bilibili URL forms
       const m1 = u.match(/BV[0-9A-Za-z]+/);
       const m2 = u.match(/[?&]bvid=(BV[0-9A-Za-z]+)/);
+      const pm = u.match(/[?&]p=(\d+)/);
       if (m1) bvid = m1[0];
       else if (m2) bvid = m2[1];
+      if (pm) {
+        const parsedPage = parseInt(pm[1], 10);
+        if (Number.isFinite(parsedPage) && parsedPage >= 1) page = parsedPage;
+      }
+    }
+
+    const explicitPage = Number((payload as any).p);
+    if (Number.isFinite(explicitPage) && explicitPage >= 1) {
+      page = Math.floor(explicitPage);
     }
 
     if (!bvid) {
@@ -40,7 +52,7 @@ export class DownloadController {
       throw new BadRequestException('bvid missing from request; provide a Bilibili video URL or bvid');
     }
 
-    const jobPayload: any = { bvid, url: payload.url, title: payload.title };
+    const jobPayload: any = { bvid, url: payload.url, title: payload.title, page };
     const job = await this.downloadService.enqueue(jobPayload);
     return { jobId: job.id };
   }
@@ -105,6 +117,7 @@ export class DownloadController {
     const cfgDataDir = String(this.config.get('download.dataDir') || path.join(process.cwd(), 'data'));
     const DATA_DIR = path.isAbsolute(cfgDataDir) ? cfgDataDir : path.resolve(process.cwd(), cfgDataDir);
     const stopKey = `job:stop:${id}`;
+    const cancelKey = `job:cancel:${id}`;
 
     // signal worker to stop the currently active job by writing a Redis key
     try {
@@ -119,19 +132,54 @@ export class DownloadController {
       try { fs.writeFileSync(path.join(DATA_DIR, `${id}.stop`), String(Date.now())); } catch (e) { }
     }
     await this.history.appendEvent(id, { state: 'stop-requested', progress: 0 });
+    await this.history.appendEvent(id, { state: 'cancel-requested', progress: 0 });
 
-    // wait for worker to acknowledge stop (worker will append 'stopped')
+    // Also emit cancellation for the old job so part-jobs stop quickly.
+    try {
+      const client: any = (this.downloadQueue as any).client;
+      if (client && typeof client.set === 'function') {
+        await client.set(cancelKey, String(Date.now()), 'EX', 120);
+        if (typeof client.publish === 'function') {
+          try { await client.publish(cancelKey, '1'); } catch (e) { }
+        }
+      }
+    } catch (e) {
+      // ignore redis errors
+    }
+    try {
+      if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
+      fs.writeFileSync(path.join(DATA_DIR, `${id}.cancel`), String(Date.now()));
+    } catch (e) {
+      // ignore fs errors
+    }
+
+    // best-effort: drop queued part jobs of old master so migrated job can proceed cleanly
+    await this.removeQueuedPartJobsForMaster(id);
+
+    // wait for worker to acknowledge stop/cancel
     const timeout = 15000; // ms
     const interval = 500; // ms
     const start = Date.now();
-    let stopped = false;
+    let acknowledged = false;
     while (Date.now() - start < timeout) {
       const hist = await this.history.getHistory(id);
-      if (hist.find(h => h.state === 'stopped')) { stopped = true; break; }
+      if (hist.find(h => h.state === 'stopped' || h.state === 'cancelled')) { acknowledged = true; break; }
+      try {
+        const current = await this.downloadQueue.getJob(id as any);
+        if (current) {
+          const state = await current.getState();
+          if (state !== 'active' && state !== 'waiting' && state !== 'delayed') { acknowledged = true; break; }
+        } else {
+          acknowledged = true;
+          break;
+        }
+      } catch (e) {
+        // ignore transient queue errors during ack polling
+      }
       await new Promise(r => setTimeout(r, interval));
     }
 
-    if (!stopped) {
+    if (!acknowledged) {
       // best-effort: proceed anyway after timeout
       await this.history.appendEvent(id, { state: 'stop-timeout', progress: 0 });
     }
@@ -150,7 +198,16 @@ export class DownloadController {
         await this.history.appendEvent(id, { state: 'requeueing', progress: 0 });
         const retryCount = Number(this.config.get('download.retryCount') ?? 3);
         const retryBackoffMs = Number(this.config.get('download.retryBackoffMs') ?? 5000);
-        newJob = await this.downloadQueue.add(data, { attempts: retryCount, backoff: retryBackoffMs });
+        const prevIds: string[] = [];
+        if ((data as any)?.resumeFromJobId) prevIds.push(String((data as any).resumeFromJobId));
+        if (Array.isArray((data as any)?.resumeFromJobIds)) {
+          for (const v of (data as any).resumeFromJobIds) {
+            if (v !== undefined && v !== null && String(v).trim()) prevIds.push(String(v));
+          }
+        }
+        const resumeFromJobIds = Array.from(new Set([String(id), ...prevIds]));
+        const resumePayload = { ...data, resumeFromJobId: String(id), resumeFromJobIds };
+        newJob = await this.downloadQueue.add(resumePayload, { attempts: retryCount, backoff: retryBackoffMs });
         await this.history.appendEvent(id, { state: 'resume-requested', progress: 1 });
       } catch (e) {
       await this.history.appendEvent(id, { state: 'requeue-failed', progress: 0, message: String(e?.message || e) });
@@ -158,6 +215,23 @@ export class DownloadController {
     }
 
     return { status: 'resume-enqueued', newJobId: newJob?.id || null };
+  }
+
+  private async removeQueuedPartJobsForMaster(jobId: string): Promise<void> {
+    try {
+      const candidates = await this.partsQueue.getJobs(['waiting', 'delayed', 'paused'], 0, 10000);
+      for (const partJob of candidates) {
+        const partJobId = String((partJob as any)?.data?.jobId || '');
+        if (partJobId !== String(jobId)) continue;
+        try {
+          await partJob.remove();
+        } catch (e) {
+          // ignore remove races
+        }
+      }
+    } catch (e) {
+      // ignore queue errors; worker-side cancel checks still protect correctness
+    }
   }
 
   @Post(':id/cancel')
@@ -205,6 +279,8 @@ export class DownloadController {
     const jobId = String(id);
     const cfgDataDir = String(this.config.get('download.dataDir') || path.join(process.cwd(), 'data'));
     const DATA_DIR = path.isAbsolute(cfgDataDir) ? cfgDataDir : path.resolve(process.cwd(), cfgDataDir);
+    const cfgResultDir = String(this.config.get('download.resultDir') || path.join(process.cwd(), 'result'));
+    const RESULT_DIR = path.isAbsolute(cfgResultDir) ? cfgResultDir : path.resolve(process.cwd(), cfgResultDir);
     const manifestDir = path.join(DATA_DIR, jobId);
     const manifestPath = path.join(manifestDir, 'manifest.json');
     if (!fs.existsSync(manifestPath)) {
@@ -271,7 +347,7 @@ export class DownloadController {
     }
     outStream.end();
 
-    const finalDir = path.join(DATA_DIR, 'bilibili', safeTitle);
+    const finalDir = path.join(RESULT_DIR, 'bilibili', safeTitle);
     try {
       if (!fs.existsSync(finalDir)) fs.mkdirSync(finalDir, { recursive: true });
     } catch (e) {

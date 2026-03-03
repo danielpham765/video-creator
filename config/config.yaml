@@ -26,11 +26,13 @@ worker:
 download:
   # Where download artifacts and manifests are stored (ENV: DATA_DIR)
   dataDir: /usr/src/app/data
+  # Where final output videos are stored (ENV: RESULT_DIR)
+  resultDir: /usr/src/app/result
   # Size per part when splitting (in megabytes). Default: 8 (ENV: PART_SIZE_BYTES)
   # Note: application should interpret this value as MB and convert to bytes.
-  partSizeBytes: 8
+  partSizeBytes: 16
   # Default download strategy when automatic detection is ambiguous.
-  # Allowed: auto | dash-single | dash-segmented | durl-byte-range
+  # Allowed: auto | dash-single | dash-segmented | dash-byte-range | durl-byte-range
   # ENV: DOWNLOAD_DEFAULT_STRATEGY
   defaultStrategy: auto
   # Per-process cap for parallel strategies:
@@ -63,6 +65,16 @@ download:
   retryCount: 3
   # Toggle resumable downloads on/off (ENV: RESUME_DOWNLOAD_ENABLED)
   resumeEnabled: true
+  # Minimum accepted Bilibili video quality code.
+  # 80 = 1080p (Full HD). Job fails if resolved quality is below this threshold.
+  # (ENV: DOWNLOAD_MIN_VIDEO_QN)
+  minVideoQn: 80
+
+playurl:
+  # Target quality code requested from Bilibili playurl API.
+  # 116 requests high quality; final accepted quality is still validated by download.minVideoQn.
+  # (ENV: PLAYURL_TARGET_QN)
+  targetQn: 116
 
 ffmpeg:
   # Path to ffmpeg binary or package-provided executable (ENV: FFMPEG_PATH)

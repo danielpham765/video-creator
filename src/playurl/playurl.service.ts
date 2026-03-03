@@ -6,17 +6,27 @@ import axios from 'axios';
 export class PlayurlService {
   constructor(private readonly config: ConfigService) {}
 
-  async getCidFromBvid(bvid: string): Promise<any> {
+  async getCidFromBvid(bvid: string, page = 1): Promise<any> {
     const base = String(this.config.get('playurl.baseUrl') || 'https://api.bilibili.com');
     const url = `${base.replace(/\/$/, '')}/x/player/pagelist?bvid=${bvid}`;
     const timeout = Number(this.config.get('playurl.timeoutMs') ?? 5000);
     const r = await axios.get(url, { timeout });
-    return r.data?.data?.[0]?.cid;
+    const list = Array.isArray(r.data?.data) ? r.data.data : [];
+    if (!list.length) return null;
+    const safePage = Number.isFinite(page) && page >= 1 ? Math.floor(page) : 1;
+    const byPage = list.find((item: any) => Number(item?.page) === safePage);
+    if (byPage?.cid) return byPage.cid;
+    return list[safePage - 1]?.cid ?? list[0]?.cid ?? null;
   }
 
   async getPlayurl(bvid: string, cid: any, cookies?: string): Promise<any> {
     const base = String(this.config.get('playurl.baseUrl') || 'https://api.bilibili.com');
-    const url = `${base.replace(/\/$/, '')}/x/player/playurl?bvid=${bvid}&cid=${cid}&qn=116&fnval=16`;
+    // Bilibili quality code:
+    // - 80: 1080p (Full HD)
+    // - 112/116/120/125/126/127: higher than 1080p depending on content/account
+    // Request a high target quality, then worker validates minimum acceptable quality.
+    const targetQn = Number(this.config.get('playurl.targetQn') ?? process.env.PLAYURL_TARGET_QN ?? 116);
+    const url = `${base.replace(/\/$/, '')}/x/player/playurl?bvid=${bvid}&cid=${cid}&qn=${targetQn}&fnval=16`;
     const headers: any = { Referer: `https://www.bilibili.com/video/${bvid}` };
     if (cookies) headers.Cookie = cookies;
     const timeout = Number(this.config.get('playurl.timeoutMs') ?? 5000);

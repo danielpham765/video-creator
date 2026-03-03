@@ -6,9 +6,26 @@ import { LoggingInterceptor } from './common/logging.interceptor';
 import { FileLoggerService } from './common/file-logger.service';
 
 async function bootstrap() {
+  const isWorker = String(process.env.WORKER || '').toLowerCase() === 'true';
   // Support dynamic AppModule.register() when AppModule is a dynamic module
   const bootstrapModule: any = (AppModule as any)?.register ? (AppModule as any).register() : AppModule;
   const logger = new FileLoggerService();
+  if (isWorker) {
+    const appContext = await NestFactory.createApplicationContext(bootstrapModule, { logger });
+    appContext.useLogger(logger);
+    logger.log('Worker application context started (HTTP server disabled)', 'Bootstrap');
+    const shutdown = async () => {
+      try {
+        await appContext.close();
+      } finally {
+        process.exit(0);
+      }
+    };
+    process.once('SIGINT', shutdown);
+    process.once('SIGTERM', shutdown);
+    await new Promise<void>(() => undefined);
+  }
+
   const app = await NestFactory.create(bootstrapModule, { logger });
   app.useLogger(logger);
 

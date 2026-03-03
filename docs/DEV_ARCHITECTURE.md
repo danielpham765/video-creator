@@ -24,7 +24,7 @@ Last updated: 2026-02-28
   - One master job per request.
   - Processor: `WorkerProcessor`.
 - `download-parts`:
-  - Part jobs for `dash-segmented` and `durl-byte-range`.
+  - Part jobs for `dash-segmented`, `dash-byte-range`, and `durl-byte-range`.
   - Processor: `PartsProcessor`.
 
 ### Module and service map
@@ -67,6 +67,15 @@ Last updated: 2026-02-28
   - key/value object
   - plain cookie string
 
+### Video quality policy (Full HD only)
+
+- Worker enforces minimum video quality by Bilibili `qn` code before download.
+- Config:
+  - `download.minVideoQn` (default `80`) -> `80` means 1080p Full HD.
+  - `playurl.targetQn` (default `116`) -> requested target quality in playurl API.
+- If resolved quality is below `download.minVideoQn`, job fails immediately.
+- For DASH, worker selects the highest video track where `id >= minVideoQn`.
+
 ### Title and output naming flow
 
 - If request has `title`: use it.
@@ -77,16 +86,17 @@ Last updated: 2026-02-28
   - Vietnamese/Latin: remove accents, lowercase, spaces -> `-`, trim duplicates.
   - Chinese/CJK: keep original (sanitized for path-invalid chars).
 - Final path:
-  - `data/bilibili/<normalizedTitle>/<bvid>-<jobId>.mp4`
+  - `result/bilibili/<normalizedTitle>/<bvid>-<jobId>.mp4`
 
 ### Strategy selection (current order)
 
 Selection logic is in `src/worker/worker.processor.ts` and follows this order:
 
 1. `dash-segmented`
-2. `durl-byte-range`
-3. `dash-single`
-4. `durl` (single file)
+2. `dash-byte-range`
+3. `durl-byte-range`
+4. `dash-single`
+5. `durl` (single file)
 
 #### 1) `dash-segmented`
 
@@ -102,7 +112,24 @@ Selection logic is in `src/worker/worker.processor.ts` and follows this order:
   - best for long content.
   - uses part-job concurrency controls.
 
-#### 2) `durl-byte-range`
+#### 2) `dash-byte-range`
+
+- Condition:
+  - `play.data.dash` has video/audio URLs.
+  - segmented manifest mode is not applicable.
+  - both DASH URLs support true range:
+    - HEAD has `content-length`
+    - `accept-ranges` contains `bytes`
+    - size >= `2 * partSizeBytes`
+    - probe GET `Range: bytes=0-1` returns `206`
+- Flow:
+  - split both video/audio streams into byte-range parts.
+  - enqueue `download-parts` with role `video` and `audio`.
+  - concat video/audio parts separately, then ffmpeg merge A/V.
+- Notes:
+  - keeps DASH quality selection while still enabling parallel parts.
+
+#### 3) `durl-byte-range`
 
 - Condition:
   - `durl` URL exists.
@@ -118,12 +145,12 @@ Selection logic is in `src/worker/worker.processor.ts` and follows this order:
 - Notes:
   - preferred over `dash-single` when applicable.
 
-#### 3) `dash-single`
+#### 4) `dash-single`
 
 - Condition:
   - DASH URLs available.
   - segmented path not applicable.
-  - and no successful `durl-byte-range` branch.
+  - and no successful `dash-byte-range` / `durl-byte-range` branch.
 - Flow:
   - master downloads full video stream + full audio stream.
   - ffmpeg merge.
@@ -131,7 +158,7 @@ Selection logic is in `src/worker/worker.processor.ts` and follows this order:
   - has byte-based debug progress logging.
   - resume support via `Range` when partial temp files exist.
 
-#### 4) `durl` (single file)
+#### 5) `durl` (single file)
 
 - Condition:
   - `durl` URL exists.

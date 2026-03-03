@@ -37,13 +37,15 @@ Source of truth for Cursor, Codex, and Antigravity AI.
 1. Client calls `POST /download` with `CreateDownloadDto` (`url` required, `title` optional).
 2. [`DownloadController.startDownload()`](/Users/danielpham/sync-workspace/05_Stories/video-creator/src/download/download.controller.ts) extracts `bvid`, then enqueues a `downloads` job.
 3. Worker resolves `cid` and play URL via [`PlayurlService`](/Users/danielpham/sync-workspace/05_Stories/video-creator/src/playurl/playurl.service.ts).
+   - Enforces Full HD policy: resolved quality must be `qn >= download.minVideoQn` (default `80`).
 4. Worker selects strategy in this order:
    - `dash-segmented`
+   - `dash-byte-range`
    - `durl-byte-range`
    - `dash-single`
    - `durl` (single file)
 5. Parts (if any) are merged, then video/audio merged by [`FfmpegService`](/Users/danielpham/sync-workspace/05_Stories/video-creator/src/ffmpeg/ffmpeg.service.ts).
-6. Final output: `data/bilibili/<safeTitle>/<bvid>-<jobId>.mp4`.
+6. Final output: `result/bilibili/<safeTitle>/<bvid>-<jobId>.mp4`.
 7. History events are appended to `data/jobs/<jobId>.json`.
 
 ### 5) Public API (Current)

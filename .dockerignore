@@ -6,3 +6,4 @@ npm-debug.log
 pnpm-lock.yaml
 .env
 data
+result

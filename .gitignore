@@ -11,6 +11,7 @@ pnpm-lock.yaml
 
 # Local runtime data and job outputs
 /data
+/result
 logs
 *.log
 

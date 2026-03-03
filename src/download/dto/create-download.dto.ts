@@ -1,5 +1,5 @@
 import { ApiProperty } from '@nestjs/swagger';
-import { IsNotEmpty, IsOptional, IsString, IsUrl } from 'class-validator';
+import { IsInt, IsNotEmpty, IsOptional, IsString, IsUrl, Min } from 'class-validator';
 
 export class CreateDownloadDto {
   @ApiProperty({
@@ -19,4 +19,15 @@ export class CreateDownloadDto {
   @IsOptional()
   @IsString()
   title?: string;
+
+  @ApiProperty({
+    description: 'Optional page/part number for multi-part Bilibili videos (1-based)',
+    required: false,
+    example: 2,
+    minimum: 1,
+  })
+  @IsOptional()
+  @IsInt()
+  @Min(1)
+  p?: number;
 }

@@ -1,6 +1,7 @@
 import * as fs from 'fs';
 import axios from 'axios';
 import * as crypto from 'crypto';
+import { formatMb, formatMbProgress } from './size-format';
 
 export type StopCheckFn = () => boolean;
 export type ProgressCallback = (bytesDelta: number) => void;
@@ -133,9 +134,9 @@ export async function resumeDownload(
       try {
         if (total) {
           const pct = ((received / total) * 100).toFixed(1);
-          (options?.logger?.debug ?? console.log)(`[download] ${dest} received ${received}/${total} bytes (${pct}%)`);
+          (options?.logger?.debug ?? console.log)(`[download] ${dest} received ${formatMbProgress(received, total)} (${pct}%)`);
         } else {
-          (options?.logger?.debug ?? console.log)(`[download] ${dest} received ${received} bytes`);
+          (options?.logger?.debug ?? console.log)(`[download] ${dest} received ${formatMb(received)} MB`);
         }
       } catch (e) {}
       lastLog = now;
