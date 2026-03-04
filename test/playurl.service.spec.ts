@@ -1,18 +1,17 @@
 import axios from 'axios';
-import { ConfigService } from '@nestjs/config';
 import { PlayurlService } from '../src/playurl/playurl.service';
 
 jest.mock('axios');
 
 describe('PlayurlService.getCidFromBvid', () => {
   const mockedAxios = axios as jest.Mocked<typeof axios>;
-  const config = {
-    get: (key: string) => {
+  const runtimeConfig = {
+    getForSource: (_source: string, key: string) => {
       if (key === 'playurl.baseUrl') return 'https://api.bilibili.com';
       if (key === 'playurl.timeoutMs') return 5000;
       return undefined;
     },
-  } as unknown as ConfigService;
+  } as any;
 
   beforeEach(() => {
     jest.clearAllMocks();
@@ -28,7 +27,7 @@ describe('PlayurlService.getCidFromBvid', () => {
       },
     } as any);
 
-    const service = new PlayurlService(config);
+    const service = new PlayurlService(runtimeConfig);
     await expect(service.getCidFromBvid('BV1abc', 2)).resolves.toBe(222);
   });
 
@@ -42,7 +41,7 @@ describe('PlayurlService.getCidFromBvid', () => {
       },
     } as any);
 
-    const service = new PlayurlService(config);
+    const service = new PlayurlService(runtimeConfig);
     await expect(service.getCidFromBvid('BV1abc', 2)).resolves.toBe(111);
   });
 });

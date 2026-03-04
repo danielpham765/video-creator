@@ -29,7 +29,7 @@ async function main() {
   for (const p of manifest.parts) {
     const jobData = {
       jobId,
-      bvid: 'TEST-SEG',
+      vid: 'TEST-SEG',
       segmentUrls: p.segmentUrls,
       partIndex: p.partIndex,
       expectedBytes: p.expectedBytes,

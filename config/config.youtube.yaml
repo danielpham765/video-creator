@@ -1,0 +1,28 @@
+download:
+  # Size per part when splitting (in megabytes). Default: 8 (ENV: PART_SIZE_BYTES)
+  # Note: application should interpret this value as MB and convert to bytes.
+  partSizeBytes: 65
+  # Per-process cap for parallel strategies:
+  # - dash-segmented
+  # - durl-byte-range
+  # ENV: PARALLEL_MAX_CONCURRENT_DOWNLOADS
+  parallelMaxConcurrentDownloads: 10
+  # Per-process cap for single-download strategies:
+  # - dash-single
+  # - durl single file
+  # ENV: SINGLE_MAX_CONCURRENT_DOWNLOADS
+  singleMaxConcurrentDownloads: 5
+  # Global cap across all worker replicas/processes for parallel strategies:
+  # - dash-segmented
+  # - durl-byte-range
+  # Set 0 to disable this limiter. (ENV: GLOBAL_PARALLEL_MAX_CONCURRENT_DOWNLOADS)
+  globalParallelMaxConcurrentDownloads: 10
+  # Global cap across all worker replicas/processes for single-download strategies:
+  # - dash-single
+  # - durl single file
+  # Set 0 to disable this limiter. (ENV: GLOBAL_SINGLE_MAX_CONCURRENT_DOWNLOADS)
+  globalSingleMaxConcurrentDownloads: 5
+  # Minimum accepted Bilibili video quality code.
+  # 80 = 1080p (Full HD). Job fails if resolved quality is below this threshold.
+  # (ENV: DOWNLOAD_MIN_VIDEO_QN)
+  minVideoQn: 80

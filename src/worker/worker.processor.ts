@@ -1,16 +1,18 @@
 import { Injectable, Logger } from '@nestjs/common';
 import { Processor, Process, InjectQueue } from '@nestjs/bull';
 import { Job, Queue } from 'bull';
-import { PlayurlService } from '../playurl/playurl.service';
 import { FfmpegService } from '../ffmpeg/ffmpeg.service';
 import { JobHistoryService } from '../jobs/job-history.service';
-import { ConfigService } from '@nestjs/config';
 import * as fs from 'fs';
 import * as path from 'path';
 import resumeDownload, { ResumeDownloadResult } from '../utils/resume-download';
 import { formatMb, formatMbProgress } from '../utils/size-format';
 import { formatElapsedDuration } from '../utils/duration-format';
 import axios from 'axios';
+import { MediaPlannerService } from '../source/media-planner.service';
+import { MediaMode, Platform, ResolvedSource } from '../source/source.types';
+import { SourceRegistryService } from '../source/source-registry.service';
+import { RuntimeConfigService } from '../config/runtime-config.service';
 
 // data directory is configurable via `config.download.dataDir` (absolute or relative)
 // part size now configured in `config.download.partSizeBytes` (MB) and converted at runtime
@@ -28,11 +30,6 @@ export class WorkerProcessor {
   private readonly logger = new Logger(WorkerProcessor.name);
   private static activeMasterJobs = 0;
   private static masterWaiters: Array<() => void> = [];
-  private readonly masterConcurrency: number;
-  private readonly singleMaxConcurrentDownloads: number;
-  private readonly globalSingleMaxConcurrentDownloads: number;
-  private readonly limiterLeaseMs: number;
-  private readonly limiterWaitMs: number;
   private readonly renewTimers = new Map<string, NodeJS.Timeout>();
   private readonly aggregateProgressLogState = new Map<string, { ts: number; downloaded: number }>();
   private readonly resultDir: string;
@@ -78,57 +75,82 @@ return 1
 `;
 
   constructor(
-    private readonly playurl: PlayurlService,
     private readonly ffmpeg: FfmpegService,
     private readonly history: JobHistoryService,
-    private readonly config: ConfigService,
+    private readonly runtimeConfig: RuntimeConfigService,
+    private readonly sourceRegistry: SourceRegistryService,
+    private readonly mediaPlanner: MediaPlannerService,
     @InjectQueue('downloads') private readonly downloadQueue?: Queue,
     @InjectQueue('download-parts') private readonly partsQueue?: Queue,
   ) {
-    const cfgDataDir = String(this.config.get('download.dataDir') || path.join(process.cwd(), 'data'));
+    const cfgDataDir = String(this.runtimeConfig.getGlobal('download.dataDir') || path.join(process.cwd(), 'data'));
     this['dataDir'] = path.isAbsolute(cfgDataDir) ? cfgDataDir : path.resolve(process.cwd(), cfgDataDir);
-    const cfgResultDir = String(this.config.get('download.resultDir') || path.join(process.cwd(), 'result'));
+    const cfgResultDir = String(this.runtimeConfig.getGlobal('download.resultDir') || path.join(process.cwd(), 'result'));
     this.resultDir = path.isAbsolute(cfgResultDir) ? cfgResultDir : path.resolve(process.cwd(), cfgResultDir);
-    const workerConcurrency = Math.max(1, Number(this.config.get('worker.concurrency') ?? 4));
-    this.singleMaxConcurrentDownloads = Math.max(1, Number(this.config.get('download.singleMaxConcurrentDownloads') ?? process.env.SINGLE_MAX_CONCURRENT_DOWNLOADS ?? 5));
-    this.masterConcurrency = Math.min(workerConcurrency, this.singleMaxConcurrentDownloads);
-    this.globalSingleMaxConcurrentDownloads = Math.max(0, Number(this.config.get('download.globalSingleMaxConcurrentDownloads') ?? process.env.GLOBAL_SINGLE_MAX_CONCURRENT_DOWNLOADS ?? 5));
-    this.limiterLeaseMs = Math.max(5000, Number(this.config.get('download.globalLimiterLeaseMs') ?? process.env.GLOBAL_LIMITER_LEASE_MS ?? 120000));
-    this.limiterWaitMs = Math.max(100, Number(this.config.get('download.globalLimiterWaitMs') ?? process.env.GLOBAL_LIMITER_WAIT_MS ?? 300));
     if (!fs.existsSync(this['dataDir'])) fs.mkdirSync(this['dataDir'], { recursive: true });
   }
 
   @Process({ concurrency: MASTER_PROCESSOR_CONCURRENCY })
   async handleJob(job: Job) {
     const jobStartedAt = Date.now();
+    let payload: any = {};
+    const manifestDir = path.join(this['dataDir'], String(job.id));
+    const manifestPath = path.join(manifestDir, 'manifest.json');
     await this.acquireMasterSlot(job);
     try {
       this.logger.log('Handling job ' + job.id);
       this.logger.debug(`job.payload=${JSON.stringify(job.data || {})}`);
-      const payload = job.data || {};
-      const bvid = payload.bvid;
-      if (!bvid) throw new Error('missing bvid');
+      payload = job.data || {};
+      const requestedPlatform = (payload.platform || 'auto') as Platform;
+      const mediaRequested = (payload.mediaRequested || 'both') as MediaMode;
+      const requestUrl = String(payload.url || '').trim();
+      if (!requestUrl) throw new Error('missing url');
+      const concretePlatform = this.sourceRegistry.identifyInput(requestUrl, requestedPlatform).platform;
       const page = Number.isFinite(Number(payload.page)) && Number(payload.page) >= 1
         ? Math.floor(Number(payload.page))
         : 1;
-      const cookies = this.loadCookiesFromConfig();
+      const cookies = this.runtimeConfig.getCookies(concretePlatform);
       if (!cookies) {
-        this.logger.warn(`Job ${job.id}: cookies not found in config/cookies.json; playback may be limited`);
+        this.logger.warn(`Job ${job.id}: cookies not found in config/cookies/${concretePlatform}.json; playback may be limited`);
       } else {
-        this.logger.debug(`Job ${job.id}: loaded cookies from config/cookies.json (${cookies.length} chars)`);
+        this.logger.debug(`Job ${job.id}: loaded cookies from config/cookies/${concretePlatform}.json (${cookies.length} chars)`);
       }
 
       await job.progress(5);
       await this.history.appendEvent(job.id.toString(), { state: 'queued', progress: 5 });
-      const cid = await this.playurl.getCidFromBvid(bvid, page);
-      if (!cid) throw new Error('cannot get cid');
       await job.progress(10);
       await this.history.appendEvent(job.id.toString(), { state: 'resolving', progress: 10 });
-      const play = await this.playurl.getPlayurl(bvid, cid, cookies);
-      this.logger.log('Playurl response code: ' + play?.code);
-      this.logger.debug('Playurl response data keys: ' + JSON.stringify(Object.keys(play?.data || {})));
-      const minQn = Number(this.config.get('download.minVideoQn') ?? process.env.DOWNLOAD_MIN_VIDEO_QN ?? 80);
-      const resolvedQn = Number(play?.data?.quality ?? 0);
+      const resolvedSource = await this.sourceRegistry.resolve({
+        url: requestUrl,
+        platform: concretePlatform,
+        page,
+        title: payload.title,
+        cookies,
+      });
+      const vid = resolvedSource.vid;
+      const platform = resolvedSource.platform;
+      const mediaPlan = this.mediaPlanner.plan(mediaRequested, resolvedSource);
+      await this.history.appendEvent(job.id.toString(), { state: 'media-requested', progress: 10, requested: mediaRequested });
+      if (mediaPlan.fallbackReason) {
+        this.logger.warn(
+          `Job ${job.id}: requested=${mediaRequested} effective=${mediaPlan.effective} reason=\"${mediaPlan.fallbackReason}\"`,
+        );
+        await this.history.appendEvent(job.id.toString(), {
+          state: 'media-fallback',
+          progress: 10,
+          requested: mediaRequested,
+          effective: mediaPlan.effective,
+          reason: mediaPlan.fallbackReason,
+        });
+      }
+      await this.history.appendEvent(job.id.toString(), { state: 'media-effective', progress: 10, effective: mediaPlan.effective });
+
+      const commonHeaders: Record<string, string> = { ...(resolvedSource.headers || {}) };
+      if (cookies && !commonHeaders.Cookie) commonHeaders.Cookie = cookies;
+      const play = this.toLegacyPlayShape(resolvedSource);
+      this.logger.debug('Resolved source streams: ' + JSON.stringify(Object.keys(play?.data || {})));
+      const minQn = Number(this.runtimeConfig.getForSource(platform, 'download.minVideoQn') ?? process.env.DOWNLOAD_MIN_VIDEO_QN ?? 80);
+      const resolvedQn = Number(resolvedSource?.qualityMeta?.qn ?? play?.data?.quality ?? 0);
       if (resolvedQn > 0 && resolvedQn < minQn) {
         throw new Error(`resolved quality qn=${resolvedQn} is below required Full HD qn=${minQn}`);
       }
@@ -143,7 +165,7 @@ return 1
       } else {
         this.logger.debug(`Job ${job.id}: no passed title; will fetch title from source`);
       }
-      let title = passedTitle || (await this.fetchVideoTitle(bvid, cookies)) || bvid;
+      let title = passedTitle || resolvedSource.title || vid;
       this.logger.debug(`Job ${job.id}: resolved raw title="${title}"`);
       if (!passedTitle && title && !this.isVietnameseOrEnglishTitle(title)) {
         this.logger.debug(`Job ${job.id}: title detected as non-VI/EN, translating to Vietnamese`);
@@ -159,22 +181,20 @@ return 1
       }
       const safeTitle = this.normalizeTitleForFolder(title);
       this.logger.debug(`Job ${job.id}: normalized folder title="${safeTitle}" from title="${title}"`);
-      const manifestDir = path.join(this['dataDir'], String(job.id));
-      const manifestPath = path.join(manifestDir, 'manifest.json');
       if (!fs.existsSync(manifestDir)) fs.mkdirSync(manifestDir, { recursive: true });
 
       // Compute part size (configured as MB in config.download.partSizeBytes)
-      const partSizeMB = Number(this.config.get('download.partSizeBytes') ?? 8);
+      const partSizeMB = Number(this.runtimeConfig.getForSource(platform, 'download.partSizeBytes') ?? 8);
       const partSizeBytes = Math.max(1, Math.floor(partSizeMB)) * 1024 * 1024;
       this.logger.debug(`Using partSizeBytes=${partSizeBytes} (${partSizeMB} MB) for job ${job.id}`);
 
       // Download options (timeout + proxy) from config
-      const downloadTimeoutMs = Number(this.config.get('download.timeoutMs') ?? 30000);
-      const proxyUrl = String(this.config.get('proxy.http') || this.config.get('proxy.https') || '');
+      const downloadTimeoutMs = Number(this.runtimeConfig.getForSource(platform, 'download.timeoutMs') ?? 30000);
+      const proxyUrl = String(this.runtimeConfig.getForSource(platform, 'proxy.http') || this.runtimeConfig.getForSource(platform, 'proxy.https') || '');
       const downloadOptions = { timeoutMs: downloadTimeoutMs, proxy: proxyUrl || undefined };
-      const retryCount = Number(this.config.get('download.retryCount') ?? 3);
-      const retryBackoffMs = Number(this.config.get('download.retryBackoffMs') ?? 5000);
-      const resumeEnabled = Boolean(this.config.get('download.resumeEnabled') ?? true);
+      const retryCount = Number(this.runtimeConfig.getForSource(platform, 'download.retryCount') ?? 3);
+      const retryBackoffMs = Number(this.runtimeConfig.getForSource(platform, 'download.retryBackoffMs') ?? 5000);
+      const resumeEnabled = Boolean(this.runtimeConfig.getForSource(platform, 'download.resumeEnabled') ?? true);
 
       const cancelFile = path.join(this['dataDir'], `${job.id}.cancel`);
       const stopFile = path.join(this['dataDir'], `${job.id}.stop`);
@@ -222,13 +242,25 @@ return 1
         if (!videoUrl || !audioUrl) throw new Error('dash urls missing');
         const videoTmp = path.join(this['dataDir'], `${job.id}-video`);
         const audioTmp = path.join(this['dataDir'], `${job.id}-audio`);
-        const tempOutFile = path.join(this['dataDir'], `${bvid}-${job.id}.mp4`);
-        this.adoptResumeArtifacts(job, payload, bvid, videoTmp, audioTmp, tempOutFile);
+        const tempOutFile = path.join(this['dataDir'], `${vid}-${job.id}.mp4`);
+        this.adoptResumeArtifacts(job, payload, vid, videoTmp, audioTmp, tempOutFile);
 
         // Persist a minimal manifest so that later tools (including partial merge)
         // know basic metadata even for non-partitioned DASH jobs.
         try {
-          const dashManifest = { strategy: 'dash-single', jobId: String(job.id), bvid, title, safeTitle, totalExpectedBytes: 0, parts: [] as any[] };
+          const dashManifest = {
+            strategy: 'dash-single',
+            jobId: String(job.id),
+            platform,
+            vid,
+            title,
+            safeTitle,
+            mediaRequested,
+            mediaEffective: mediaPlan.effective,
+            mediaFallbackReason: mediaPlan.fallbackReason || null,
+            totalExpectedBytes: 0,
+            parts: [] as any[],
+          };
           fs.writeFileSync(manifestPath, JSON.stringify(dashManifest, null, 2), 'utf8');
         } catch (e) {}
 
@@ -255,7 +287,7 @@ return 1
         let segmentList: string[] | null = null;
         let audioSegmentList: string[] | null = null;
         try {
-          const manifestResp = await axios.get(videoUrl, { headers: { Referer: `https://www.bilibili.com/video/${bvid}`, Cookie: cookies }, timeout: 5000, responseType: 'text', maxContentLength: 128 * 1024, maxBodyLength: 128 * 1024 });
+          const manifestResp = await axios.get(videoUrl, { headers: commonHeaders, timeout: 5000, responseType: 'text', maxContentLength: 128 * 1024, maxBodyLength: 128 * 1024 });
           const body = String(manifestResp.data || '');
           if (body.includes('#EXTM3U')) {
             const lines = body.split(/\r?\n/).map((l) => l.trim());
@@ -276,7 +308,7 @@ return 1
         } catch (e) { segmentList = null; }
 
         try {
-          const manifestRespA = await axios.get(audioUrl, { headers: { Referer: `https://www.bilibili.com/video/${bvid}`, Cookie: cookies }, timeout: 5000, responseType: 'text', maxContentLength: 128 * 1024, maxBodyLength: 128 * 1024 });
+          const manifestRespA = await axios.get(audioUrl, { headers: commonHeaders, timeout: 5000, responseType: 'text', maxContentLength: 128 * 1024, maxBodyLength: 128 * 1024 });
           const bodyA = String(manifestRespA.data || '');
           if (bodyA.includes('#EXTM3U')) {
             const lines = bodyA.split(/\r?\n/).map((l) => l.trim()); const segs: string[] = []; for (const line of lines) { if (!line || line.startsWith('#')) continue; try { segs.push(new URL(line, audioUrl).href); } catch (e) {} }
@@ -300,7 +332,7 @@ return 1
 
           const segments: Array<{ url: string; approxBytes: number }> = [];
           for (let i = 0; i < segmentList.length; i++) {
-            const su = segmentList[i]; let approx = 0; try { const h = await axios.head(su, { headers: { Referer: `https://www.bilibili.com/video/${bvid}`, Cookie: cookies }, timeout: 5000 }); approx = parseInt(h.headers['content-length'] || '0', 10) || 0; } catch (e) { approx = 0; }
+            const su = segmentList[i]; let approx = 0; try { const h = await axios.head(su, { headers: commonHeaders, timeout: 5000 }); approx = parseInt(h.headers['content-length'] || '0', 10) || 0; } catch (e) { approx = 0; }
             segments.push({ url: su, approxBytes: approx });
           }
 
@@ -312,7 +344,7 @@ return 1
               const su = audioSegmentList[i];
               let approx = 0;
               try {
-                const h = await axios.head(su, { headers: { Referer: `https://www.bilibili.com/video/${bvid}`, Cookie: cookies }, timeout: 5000 });
+                const h = await axios.head(su, { headers: commonHeaders, timeout: 5000 });
                 approx = parseInt(h.headers['content-length'] || '0', 10) || 0;
               } catch (e) {
                 approx = 0;
@@ -341,7 +373,19 @@ return 1
           const videoExpectedBytes = videoParts.reduce((s, p) => s + (p.expectedBytes || 0), 0);
           const audioExpectedBytes = finalAudioParts.reduce((s, p) => s + (p.expectedBytes || 0), 0);
           const totalExpectedBytes = videoExpectedBytes + audioExpectedBytes;
-          const manifest = { strategy: 'dash-segmented', jobId: String(job.id), bvid, title, safeTitle, totalExpectedBytes, parts: videoParts };
+          const manifest = {
+            strategy: 'dash-segmented',
+            jobId: String(job.id),
+            platform,
+            vid,
+            title,
+            safeTitle,
+            mediaRequested,
+            mediaEffective: mediaPlan.effective,
+            mediaFallbackReason: mediaPlan.fallbackReason || null,
+            totalExpectedBytes,
+            parts: videoParts,
+          };
           fs.writeFileSync(manifestPath, JSON.stringify(manifest, null, 2), 'utf8');
           await this.setTotalExpectedBytes(redisClient, String(job.id), totalExpectedBytes);
 
@@ -362,12 +406,12 @@ return 1
           await this.history.appendEvent(job.id.toString(), { state: 'segmenting', progress: 30, manifestPath });
           this.logger.log(`Job ${job.id}: segmented manifest written with ${videoParts.length} parts`);
 
-          const headers = { Referer: `https://www.bilibili.com/video/${bvid}`, Cookie: cookies || '' };
+          const headers = { ...commonHeaders };
           const totalPartJobs = videoParts.length + finalAudioParts.length;
           const partJobs: Job[] = [];
           for (const p of videoParts) {
             this.logger.debug(`Enqueue video part job=${job.id} part=${p.partIndex} expectedBytes=${p.expectedBytes}`);
-            const j = await this.partsQueue!.add({ jobId: String(job.id), bvid, totalJobCount: totalPartJobs, segmentUrls: p.segmentUrls, partIndex: p.partIndex, expectedBytes: p.expectedBytes || 0, headers, role: 'video' } as any, { attempts: retryCount, backoff: retryBackoffMs });
+            const j = await this.partsQueue!.add({ jobId: String(job.id), vid, platform, totalJobCount: totalPartJobs, segmentUrls: p.segmentUrls, partIndex: p.partIndex, expectedBytes: p.expectedBytes || 0, headers, role: 'video' } as any, { attempts: retryCount, backoff: retryBackoffMs });
             partJobs.push(j);
           }
 
@@ -375,14 +419,14 @@ return 1
           if (finalAudioParts.length > 0) {
             for (const p of finalAudioParts) {
               this.logger.debug(`Enqueue audio part job=${job.id} part=${p.partIndex} expectedBytes=${p.expectedBytes}`);
-              const j = await this.partsQueue!.add({ jobId: String(job.id), bvid, totalJobCount: totalPartJobs, segmentUrls: p.segmentUrls, partIndex: p.partIndex, expectedBytes: p.expectedBytes || 0, headers, role: 'audio' } as any, { attempts: retryCount, backoff: retryBackoffMs });
+              const j = await this.partsQueue!.add({ jobId: String(job.id), vid, platform, totalJobCount: totalPartJobs, segmentUrls: p.segmentUrls, partIndex: p.partIndex, expectedBytes: p.expectedBytes || 0, headers, role: 'audio' } as any, { attempts: retryCount, backoff: retryBackoffMs });
               audioPartJobs.push(j);
             }
           }
 
           // Wait for all part jobs to complete with stall detection.
           // Important: do not treat waiting/delayed jobs as stalled just because they are queued.
-          const activeStallMs = 45000;
+          const activeStallMs = Math.max(30000, Number(this.runtimeConfig.getForSource(platform, 'download.partActiveStallMs') ?? 180000));
           const pollMs = 5000;
           const lastProgress: Record<string, { value: number; ts: number; state: string; bytes: number }> = {};
           let remaining = partJobs.length + (Array.isArray(audioPartJobs) ? audioPartJobs.length : 0);
@@ -480,7 +524,7 @@ return 1
                   `${job.id} segmented-audio-fallback`,
                   audioUrl,
                   audioTmp,
-                  { Referer: `https://www.bilibili.com/video/${bvid}`, Cookie: cookies },
+                  commonHeaders,
                   cancelFile,
                   () => stopRequested || cancelRequested,
                   undefined,
@@ -505,7 +549,7 @@ return 1
 
         // Strategy order: dash-segmented -> dash-byte-range -> durl-byte-range -> dash-single.
         if (!didSegment && this.partsQueue) {
-          const headers = { Referer: `https://www.bilibili.com/video/${bvid}`, Cookie: cookies || '' };
+          const headers = { ...commonHeaders };
           const [videoProbe, audioProbe] = await Promise.all([
             this.probeByteRangeParallel(videoUrl, headers, partSizeBytes),
             this.probeByteRangeParallel(audioUrl, headers, partSizeBytes),
@@ -525,7 +569,7 @@ return 1
             const manifest = {
               strategy: 'dash-byte-range',
               jobId: String(job.id),
-              bvid,
+              vid,
               title,
               safeTitle,
               totalExpectedBytes,
@@ -575,7 +619,7 @@ return 1
                 continue;
               }
               const j = await this.partsQueue.add(
-                { jobId: String(job.id), bvid, totalJobCount: totalPartJobs, url: videoUrl, partIndex: p.partIndex, rangeStart: p.rangeStart, rangeEnd: p.rangeEnd, expectedBytes: p.expectedBytes, headers, role: 'video' } as any,
+                { jobId: String(job.id), vid, totalJobCount: totalPartJobs, url: videoUrl, partIndex: p.partIndex, rangeStart: p.rangeStart, rangeEnd: p.rangeEnd, expectedBytes: p.expectedBytes, headers, role: 'video' } as any,
                 { attempts: retryCount, backoff: retryBackoffMs },
               );
               partJobs.push(j);
@@ -598,14 +642,14 @@ return 1
                   continue;
                 }
                 const j = await this.partsQueue.add(
-                  { jobId: String(job.id), bvid, totalJobCount: totalPartJobs, url: audioUrl, partIndex: p.partIndex, rangeStart: p.rangeStart, rangeEnd: p.rangeEnd, expectedBytes: p.expectedBytes, headers, role: 'audio' } as any,
+                  { jobId: String(job.id), vid, totalJobCount: totalPartJobs, url: audioUrl, partIndex: p.partIndex, rangeStart: p.rangeStart, rangeEnd: p.rangeEnd, expectedBytes: p.expectedBytes, headers, role: 'audio' } as any,
                   { attempts: retryCount, backoff: retryBackoffMs },
                 );
                 audioPartJobs.push(j);
               }
             }
 
-            const activeStallMs = 45000;
+            const activeStallMs = Math.max(30000, Number(this.runtimeConfig.getForSource(platform, 'download.partActiveStallMs') ?? 180000));
             const pollMs = 5000;
             const lastProgress: Record<string, { value: number; ts: number; state: string; bytes: number }> = {};
             let remaining = partJobs.length + audioPartJobs.length;
@@ -680,7 +724,7 @@ return 1
                 `${job.id} dash-byte-range-audio-fallback`,
                 audioUrl,
                 audioTmp,
-                { Referer: `https://www.bilibili.com/video/${bvid}`, Cookie: cookies },
+                commonHeaders,
                 cancelFile,
                 () => stopRequested || cancelRequested,
                 undefined,
@@ -713,7 +757,7 @@ return 1
             this.logger.log(`Job ${job.id}: trying durl-byte-range before dash-single fallback`);
             let useParallel = false; let totalSize = 0;
             try {
-              const head = await axios.head(durlUrl, { headers: { Referer: `https://www.bilibili.com/video/${bvid}`, Cookie: cookies }, timeout: 5000 });
+              const head = await axios.head(durlUrl, { headers: commonHeaders, timeout: 5000 });
               const acceptRanges = String(head.headers['accept-ranges'] || '').toLowerCase();
               const contentLength = parseInt(head.headers['content-length'] || '0', 10) || 0;
               if (contentLength > 0) totalSize = contentLength;
@@ -721,7 +765,7 @@ return 1
                 let rangeProbeOk = false;
                 try {
                   const probe = await axios.get(durlUrl, {
-                    headers: { Referer: `https://www.bilibili.com/video/${bvid}`, Cookie: cookies, Range: 'bytes=0-1' },
+                    headers: { ...commonHeaders, Range: 'bytes=0-1' },
                     timeout: 5000,
                     responseType: 'stream',
                     validateStatus: (status: number) => status === 200 || status === 206,
@@ -750,15 +794,28 @@ return 1
                 parts.push({ partIndex: i, rangeStart: start, rangeEnd: end, expectedBytes, state: 'pending', downloadedBytes: 0 });
               }
 
-              const manifest = { strategy: 'durl-byte-range', jobId: String(job.id), bvid, title, safeTitle, url: durlUrl, totalExpectedBytes: totalSize, parts };
+              const manifest = {
+                strategy: 'durl-byte-range',
+                jobId: String(job.id),
+                platform,
+                vid,
+                title,
+                safeTitle,
+                mediaRequested,
+                mediaEffective: mediaPlan.effective,
+                mediaFallbackReason: mediaPlan.fallbackReason || null,
+                url: durlUrl,
+                totalExpectedBytes: totalSize,
+                parts,
+              };
               fs.writeFileSync(manifestPath, JSON.stringify(manifest, null, 2), 'utf8');
               this.logger.log(`Job ${job.id}: created byte-range manifest with ${parts.length} parts (total ${totalSize} bytes)`);
               if (redisClient) { try { const key = `job:parts:${job.id}`; await redisClient.hset(key, 'totalExpectedBytes', String(totalSize)); for (const p of parts) { await redisClient.hset(key, `part:${p.partIndex}:expectedBytes`, String(p.expectedBytes)); await redisClient.hset(key, `part:${p.partIndex}:state`, 'pending'); } } catch (e) {} }
               await this.history.appendEvent(job.id.toString(), { state: 'segmenting', progress: 35, manifestPath });
-              const headers = { Referer: `https://www.bilibili.com/video/${bvid}`, Cookie: cookies || '' };
+              const headers = { ...commonHeaders };
               const partJobs = [];
-              for (const p of parts) { this.logger.debug(`Enqueue byte-range part job=${job.id} part=${p.partIndex} range=${p.rangeStart}-${p.rangeEnd} expected=${p.expectedBytes}`); const j = await this.partsQueue!.add({ jobId: String(job.id), bvid, totalJobCount: parts.length, url: durlUrl, partIndex: p.partIndex, rangeStart: p.rangeStart, rangeEnd: p.rangeEnd, expectedBytes: p.expectedBytes, headers } as any, { attempts: retryCount, backoff: retryBackoffMs }); partJobs.push(j); }
-              const activeStallMs = 45000;
+              for (const p of parts) { this.logger.debug(`Enqueue byte-range part job=${job.id} part=${p.partIndex} range=${p.rangeStart}-${p.rangeEnd} expected=${p.expectedBytes}`); const j = await this.partsQueue!.add({ jobId: String(job.id), vid, platform, totalJobCount: parts.length, url: durlUrl, partIndex: p.partIndex, rangeStart: p.rangeStart, rangeEnd: p.rangeEnd, expectedBytes: p.expectedBytes, headers } as any, { attempts: retryCount, backoff: retryBackoffMs }); partJobs.push(j); }
+              const activeStallMs = Math.max(30000, Number(this.runtimeConfig.getForSource(platform, 'download.partActiveStallMs') ?? 180000));
               const pollMs = 5000;
               const lastProgress: Record<string, { value: number; ts: number; state: string; bytes: number }> = {};
               let remaining = partJobs.length;
@@ -838,11 +895,11 @@ return 1
           if (fs.existsSync(cancelFile) || cancelRequested) { await this.history.appendEvent(job.id.toString(), { state: 'cancelled', progress: 0 }); this.logger.log(`Job ${job.id} cancelled before download start`); return { cancelled: true }; }
           let dashSingleTotalSize = 0;
           try {
-            const vh = await axios.head(videoUrl, { headers: { Referer: `https://www.bilibili.com/video/${bvid}`, Cookie: cookies }, timeout: 5000 });
+            const vh = await axios.head(videoUrl, { headers: commonHeaders, timeout: 5000 });
             dashSingleTotalSize += parseInt(vh.headers['content-length'] || '0', 10) || 0;
           } catch (e) {}
           try {
-            const ah = await axios.head(audioUrl, { headers: { Referer: `https://www.bilibili.com/video/${bvid}`, Cookie: cookies }, timeout: 5000 });
+            const ah = await axios.head(audioUrl, { headers: commonHeaders, timeout: 5000 });
             dashSingleTotalSize += parseInt(ah.headers['content-length'] || '0', 10) || 0;
           } catch (e) {}
           if (dashSingleTotalSize > 0) await this.setTotalExpectedBytes(redisClient, String(job.id), dashSingleTotalSize);
@@ -872,7 +929,7 @@ return 1
               `${job.id} dash-video`,
               videoUrl,
               videoTmp,
-              { Referer: `https://www.bilibili.com/video/${bvid}`, Cookie: cookies },
+              commonHeaders,
               cancelFile,
               () => stopRequested || cancelRequested,
               onDashProgress,
@@ -895,7 +952,7 @@ return 1
                 `${job.id} dash-audio`,
                 audioUrl,
                 audioTmp,
-                { Referer: `https://www.bilibili.com/video/${bvid}`, Cookie: cookies },
+                commonHeaders,
                 cancelFile,
                 () => stopRequested || cancelRequested,
                 onDashProgress,
@@ -917,18 +974,40 @@ return 1
           }
         }
 
-        // Move final file into <dataDir>/bilibili/<title>/<bvid>-<jobId>.mp4
-        const finalDir = path.join(this.resultDir, 'bilibili', safeTitle);
+        const preparedOutput = await this.applyMediaModeOutput(tempOutFile, manifestDir, String(job.id), mediaPlan.effective);
+        const ext = mediaPlan.effective === 'audio' ? 'm4a' : 'mp4';
+        // Move final file into <resultDir>/<platform>/<title>/<vid>-<jobId>.<ext>
+        const finalDir = path.join(this.resultDir, platform, safeTitle);
         try { if (!fs.existsSync(finalDir)) fs.mkdirSync(finalDir, { recursive: true }); } catch (e) {}
-        const finalPath = fs.existsSync(finalDir) ? path.join(finalDir, `${bvid}-${job.id}.mp4`) : tempOutFile;
-        if (finalPath !== tempOutFile) { try { fs.renameSync(tempOutFile, finalPath); } catch (e) {} }
+        const finalPath = fs.existsSync(finalDir) ? path.join(finalDir, `${vid}-${job.id}.${ext}`) : preparedOutput;
+        if (finalPath !== preparedOutput) { try { fs.renameSync(preparedOutput, finalPath); } catch (e) {} }
 
         await job.progress(100);
-        await this.history.appendEvent(job.id.toString(), { state: 'finished', progress: 100, result: { path: finalPath, bvid, title } });
+        await this.history.appendEvent(job.id.toString(), {
+          state: 'finished',
+          progress: 100,
+          result: {
+            path: finalPath,
+            platform,
+            vid,
+            title,
+            mediaRequested,
+            mediaEffective: mediaPlan.effective,
+            mediaFallbackReason: mediaPlan.fallbackReason || null,
+          },
+        });
         try { if (fs.existsSync(cancelFile)) fs.unlinkSync(cancelFile); } catch (e) {}
         this.cleanupJobTempArtifacts(String(job.id), finalPath);
         this.logger.log(`Job ${job.id} finished in ${formatElapsedDuration(Date.now() - jobStartedAt)}, output: ${finalPath}`);
-        return { path: finalPath };
+        return {
+          path: finalPath,
+          platform,
+          vid,
+          title,
+          mediaRequested,
+          mediaEffective: mediaPlan.effective,
+          mediaFallbackReason: mediaPlan.fallbackReason || null,
+        };
       }
 
       // existing durl (single url / byte-range) flow remains unchanged
@@ -937,8 +1016,8 @@ return 1
           throw new Error(`durl quality qn=${resolvedQn} is below required Full HD qn=${minQn}`);
         }
         const url = play.data.durl[0].url;
-        const tempOutFile = path.join(this['dataDir'], `${bvid}-${job.id}.mp4`);
-        this.adoptResumeArtifacts(job, payload, bvid, undefined, undefined, tempOutFile);
+        const tempOutFile = path.join(this['dataDir'], `${vid}-${job.id}.mp4`);
+        this.adoptResumeArtifacts(job, payload, vid, undefined, undefined, tempOutFile);
         if (fs.existsSync(cancelFile)) { await this.history.appendEvent(job.id.toString(), { state: 'cancelled', progress: 0 }); this.logger.log(`Job ${job.id} cancelled before download start`); return { cancelled: true }; }
         await job.progress(30);
         await this.history.appendEvent(job.id.toString(), { state: 'downloading', progress: 30 });
@@ -946,7 +1025,7 @@ return 1
         // Try to get content-length and Accept-Ranges to decide whether to use parallel parts.
         let useParallel = false; let totalSize = 0;
         try {
-          const head = await axios.head(url, { headers: { Referer: `https://www.bilibili.com/video/${bvid}`, Cookie: cookies }, timeout: 5000 });
+          const head = await axios.head(url, { headers: commonHeaders, timeout: 5000 });
           const acceptRanges = String(head.headers['accept-ranges'] || '').toLowerCase();
           const contentLength = parseInt(head.headers['content-length'] || '0', 10) || 0;
           if (contentLength > 0) {
@@ -959,7 +1038,7 @@ return 1
               let rangeProbeOk = false;
               try {
                 const probe = await axios.get(url, {
-                  headers: { Referer: `https://www.bilibili.com/video/${bvid}`, Cookie: cookies, Range: 'bytes=0-1' },
+                  headers: { ...commonHeaders, Range: 'bytes=0-1' },
                   timeout: 5000,
                   responseType: 'stream',
                   validateStatus: (status: number) => status === 200 || status === 206,
@@ -1002,7 +1081,7 @@ return 1
             `${job.id} durl-single`,
             url,
             tempOutFile,
-            { Referer: `https://www.bilibili.com/video/${bvid}`, Cookie: cookies },
+            commonHeaders,
             cancelFile,
             undefined,
             onProgress,
@@ -1017,15 +1096,28 @@ return 1
           const partSize = partSizeBytes; const partCount = Math.ceil(totalSize / partSize); const partsDir = path.join(manifestDir, 'parts'); if (!fs.existsSync(manifestDir)) fs.mkdirSync(manifestDir, { recursive: true }); if (!fs.existsSync(partsDir)) fs.mkdirSync(partsDir, { recursive: true });
           const parts: any[] = [];
           for (let i = 0; i < partCount; i++) { const start = i * partSize; const end = Math.min(totalSize - 1, (i + 1) * partSize - 1); const expectedBytes = end - start + 1; parts.push({ partIndex: i, rangeStart: start, rangeEnd: end, expectedBytes, state: 'pending', downloadedBytes: 0 }); }
-          const manifest = { strategy: 'durl-byte-range', jobId: String(job.id), bvid, title, safeTitle, url, totalExpectedBytes: totalSize, parts };
+          const manifest = {
+            strategy: 'durl-byte-range',
+            jobId: String(job.id),
+            platform,
+            vid,
+            title,
+            safeTitle,
+            mediaRequested,
+            mediaEffective: mediaPlan.effective,
+            mediaFallbackReason: mediaPlan.fallbackReason || null,
+            url,
+            totalExpectedBytes: totalSize,
+            parts,
+          };
           fs.writeFileSync(manifestPath, JSON.stringify(manifest, null, 2), 'utf8');
           this.logger.log(`Job ${job.id}: created byte-range manifest with ${parts.length} parts (total ${totalSize} bytes)`);
           if (redisClient) { try { const key = `job:parts:${job.id}`; await redisClient.hset(key, 'totalExpectedBytes', String(totalSize)); for (const p of parts) { await redisClient.hset(key, `part:${p.partIndex}:expectedBytes`, String(p.expectedBytes)); await redisClient.hset(key, `part:${p.partIndex}:state`, 'pending'); } } catch (e) {} }
           await this.history.appendEvent(job.id.toString(), { state: 'segmenting', progress: 35, manifestPath });
-          const headers = { Referer: `https://www.bilibili.com/video/${bvid}`, Cookie: cookies || '' };
+          const headers = { ...commonHeaders };
           const partJobs = [];
-          for (const p of parts) { this.logger.debug(`Enqueue byte-range part job=${job.id} part=${p.partIndex} range=${p.rangeStart}-${p.rangeEnd} expected=${p.expectedBytes}`); const j = await this.partsQueue!.add({ jobId: String(job.id), bvid, totalJobCount: parts.length, url, partIndex: p.partIndex, rangeStart: p.rangeStart, rangeEnd: p.rangeEnd, expectedBytes: p.expectedBytes, headers } as any, { attempts: retryCount, backoff: retryBackoffMs }); partJobs.push(j); }
-          const activeStallMs = 45000;
+          for (const p of parts) { this.logger.debug(`Enqueue byte-range part job=${job.id} part=${p.partIndex} range=${p.rangeStart}-${p.rangeEnd} expected=${p.expectedBytes}`); const j = await this.partsQueue!.add({ jobId: String(job.id), vid, platform, totalJobCount: parts.length, url, partIndex: p.partIndex, rangeStart: p.rangeStart, rangeEnd: p.rangeEnd, expectedBytes: p.expectedBytes, headers } as any, { attempts: retryCount, backoff: retryBackoffMs }); partJobs.push(j); }
+          const activeStallMs = Math.max(30000, Number(this.runtimeConfig.getForSource(platform, 'download.partActiveStallMs') ?? 180000));
           const pollMs = 5000;
           const lastProgress: Record<string, { value: number; ts: number; state: string; bytes: number }> = {};
           let remaining = partJobs.length;
@@ -1096,16 +1188,42 @@ return 1
         await job.progress(100);
         try { if (fs.existsSync(stopFile) || stopRequested) { await this.history.appendEvent(job.id.toString(), { state: 'stopped', progress: 0 }); this.logger.log(`Job ${job.id} stopped during download`); try { if (redisClient) await redisClient.del(stopKey); } catch (e) {} try { if (fs.existsSync(stopFile)) fs.unlinkSync(stopFile); } catch (e) {} if (_poll) clearInterval(_poll); return { stopped: true }; } } catch (e) {}
         try { if (fs.existsSync(cancelFile)) { await this.history.appendEvent(job.id.toString(), { state: 'cancelled', progress: 0 }); this.logger.log(`Job ${job.id} cancelled during download`); return { cancelled: true }; } } catch (e) {}
-        const finalDir = path.join(this.resultDir, 'bilibili', safeTitle); try { if (!fs.existsSync(finalDir)) fs.mkdirSync(finalDir, { recursive: true }); } catch (e) {}
-        const finalPath = fs.existsSync(finalDir) ? path.join(finalDir, `${bvid}-${job.id}.mp4`) : tempOutFile; if (finalPath !== tempOutFile) { try { fs.renameSync(tempOutFile, finalPath); } catch (e) {} }
-        await this.history.appendEvent(job.id.toString(), { state: 'finished', progress: 100, result: { path: finalPath, bvid, title } }); try { if (fs.existsSync(cancelFile)) fs.unlinkSync(cancelFile); } catch (e) {}
+        const preparedOutput = await this.applyMediaModeOutput(tempOutFile, manifestDir, String(job.id), mediaPlan.effective);
+        const ext = mediaPlan.effective === 'audio' ? 'm4a' : 'mp4';
+        const finalDir = path.join(this.resultDir, platform, safeTitle); try { if (!fs.existsSync(finalDir)) fs.mkdirSync(finalDir, { recursive: true }); } catch (e) {}
+        const finalPath = fs.existsSync(finalDir) ? path.join(finalDir, `${vid}-${job.id}.${ext}`) : preparedOutput; if (finalPath !== preparedOutput) { try { fs.renameSync(preparedOutput, finalPath); } catch (e) {} }
+        await this.history.appendEvent(job.id.toString(), {
+          state: 'finished',
+          progress: 100,
+          result: {
+            path: finalPath,
+            platform,
+            vid,
+            title,
+            mediaRequested,
+            mediaEffective: mediaPlan.effective,
+            mediaFallbackReason: mediaPlan.fallbackReason || null,
+          },
+        }); try { if (fs.existsSync(cancelFile)) fs.unlinkSync(cancelFile); } catch (e) {}
         this.cleanupJobTempArtifacts(String(job.id), finalPath);
         this.logger.log(`Job ${job.id} finished in ${formatElapsedDuration(Date.now() - jobStartedAt)}, output: ${finalPath}`);
-        return { path: finalPath };
+        return {
+          path: finalPath,
+          platform,
+          vid,
+          title,
+          mediaRequested,
+          mediaEffective: mediaPlan.effective,
+          mediaFallbackReason: mediaPlan.fallbackReason || null,
+        };
       }
 
       throw new Error('No downloadable urls found or DRM-protected');
     } catch (err: any) {
+      const recovered = await this.tryFinalizeCompletedByteRangeManifest(job, payload, manifestDir, manifestPath);
+      if (recovered) return recovered;
+      const recoveredSingle = await this.tryFinalizeSingleModeArtifacts(job, payload, manifestDir, manifestPath);
+      if (recoveredSingle) return recoveredSingle;
       this.logger.error(`Job ${job.id} failed: ${err?.message || err}`);
       try { await job.progress(0); } catch (e) { }
       try { await this.history.appendEvent(job.id.toString(), { state: 'failed', progress: 0, message: err?.message }); } catch (e) { }
@@ -1113,6 +1231,324 @@ return 1
     }
     finally {
       this.releaseMasterSlot();
+    }
+  }
+
+  private toLegacyPlayShape(source: ResolvedSource): any {
+    const dashPair = source.streams.dashPair;
+    const videoOnly = source.streams.videoOnly;
+    const audioOnly = source.streams.audioOnly;
+    const muxed = source.streams.muxedBoth || source.streams.audioOnly || source.streams.videoOnly;
+    const hasDash = Boolean(dashPair || (videoOnly && audioOnly));
+    return {
+      data: {
+        quality: Number(source.qualityMeta?.qn || 0) || 0,
+        dash: hasDash
+          ? {
+              video: [{ id: Number(source.qualityMeta?.qn || 80) || 80, baseUrl: dashPair?.videoUrl || videoOnly?.url }],
+              audio: [{ id: 30280, baseUrl: dashPair?.audioUrl || audioOnly?.url }],
+            }
+          : undefined,
+        durl: muxed?.url ? [{ url: muxed.url }] : undefined,
+      },
+    };
+  }
+
+  private async applyMediaModeOutput(
+    inputPath: string,
+    manifestDir: string,
+    jobId: string,
+    mode: MediaMode,
+  ): Promise<string> {
+    if (mode === 'both') return inputPath;
+    if (!fs.existsSync(inputPath)) return inputPath;
+    if (mode === 'video') {
+      const out = path.join(manifestDir, `${jobId}-video-only.mp4`);
+      try { if (fs.existsSync(out)) fs.unlinkSync(out); } catch (e) {}
+      await this.ffmpeg.stripAudio(inputPath, out);
+      try { fs.unlinkSync(inputPath); } catch (e) {}
+      return out;
+    }
+    const out = path.join(manifestDir, `${jobId}-audio-only.m4a`);
+    try { if (fs.existsSync(out)) fs.unlinkSync(out); } catch (e) {}
+    await this.ffmpeg.extractAudioToM4a(inputPath, out);
+    try { fs.unlinkSync(inputPath); } catch (e) {}
+    return out;
+  }
+
+  private async tryFinalizeCompletedByteRangeManifest(
+    job: Job,
+    payload: any,
+    manifestDir: string,
+    manifestPath: string,
+  ): Promise<any | null> {
+    try {
+      if (!fs.existsSync(manifestPath)) return null;
+      const raw = await fs.promises.readFile(manifestPath, 'utf8');
+      const manifest = JSON.parse(raw || '{}');
+      const partsDir = path.join(manifestDir, 'parts');
+      if (!fs.existsSync(partsDir)) return null;
+      const strategy = String(manifest?.strategy || '');
+      const vid = String(manifest?.vid || payload?.vid || `job-${job.id}`);
+      const platform = String(manifest?.platform || payload?.platform || 'generic');
+      const title = String(manifest?.title || payload?.title || vid);
+      const safeTitle = String(manifest?.safeTitle || this.normalizeTitleForFolder(title));
+      const mediaRequested = String(manifest?.mediaRequested || payload?.mediaRequested || 'both');
+      const mediaEffective = String(manifest?.mediaEffective || mediaRequested);
+      const mediaFallbackReason = manifest?.mediaFallbackReason || null;
+
+      await this.history.appendEvent(String(job.id), { state: 'recovering-merge', progress: 90, from: 'completed-manifest' });
+      let recoveryInputPath: string | null = null;
+
+      if (strategy === 'durl-byte-range') {
+        const parts: any[] = Array.isArray(manifest?.parts) ? manifest.parts : [];
+        if (!parts.length) return null;
+        for (let i = 0; i < parts.length; i++) {
+          if (!fs.existsSync(path.join(partsDir, `part-${i}.bin`))) return null;
+        }
+        const mergedTmp = path.join(manifestDir, `${job.id}-recovered-merged.mp4`);
+        try { if (fs.existsSync(mergedTmp)) fs.unlinkSync(mergedTmp); } catch (e) {}
+        await this.concatByteRangeParts(partsDir, 'part-', parts.length, mergedTmp);
+        recoveryInputPath = mergedTmp;
+      } else if (strategy === 'dash-byte-range') {
+        const videoParts: any[] = Array.isArray(manifest?.video?.parts) ? manifest.video.parts : [];
+        const audioParts: any[] = Array.isArray(manifest?.audio?.parts) ? manifest.audio.parts : [];
+        if (!videoParts.length) return null;
+        for (const p of videoParts) {
+          if (!fs.existsSync(path.join(partsDir, `part-${Number(p?.partIndex || 0)}.bin`))) return null;
+        }
+        const videoConcatTmp = path.join(manifestDir, `${job.id}-recovered-video-concat.mp4`);
+        try { if (fs.existsSync(videoConcatTmp)) fs.unlinkSync(videoConcatTmp); } catch (e) {}
+        await this.concatByteRangeParts(partsDir, 'part-', videoParts.length, videoConcatTmp);
+
+        let audioConcatTmp: string | null = null;
+        if (audioParts.length > 0) {
+          for (const p of audioParts) {
+            if (!fs.existsSync(path.join(partsDir, `audio-part-${Number(p?.partIndex || 0)}.bin`))) return null;
+          }
+          audioConcatTmp = path.join(manifestDir, `${job.id}-recovered-audio-concat.mp4`);
+          try { if (fs.existsSync(audioConcatTmp)) fs.unlinkSync(audioConcatTmp); } catch (e) {}
+          await this.concatByteRangeParts(partsDir, 'audio-part-', audioParts.length, audioConcatTmp);
+        }
+
+        if (mediaEffective === 'video') {
+          recoveryInputPath = videoConcatTmp;
+        } else if (mediaEffective === 'audio') {
+          if (!audioConcatTmp) return null;
+          recoveryInputPath = audioConcatTmp;
+        } else {
+          if (!audioConcatTmp) return null;
+          const mergedTmp = path.join(manifestDir, `${job.id}-recovered-merged.mp4`);
+          try { if (fs.existsSync(mergedTmp)) fs.unlinkSync(mergedTmp); } catch (e) {}
+          await this.ffmpeg.merge(videoConcatTmp, audioConcatTmp, mergedTmp);
+          recoveryInputPath = mergedTmp;
+        }
+      } else if (strategy === 'dash-segmented') {
+        const videoParts: any[] = Array.isArray(manifest?.parts) ? manifest.parts : [];
+        if (!videoParts.length) return null;
+        for (let i = 0; i < videoParts.length; i++) {
+          if (!fs.existsSync(path.join(partsDir, `part-${i}.bin`))) return null;
+        }
+        const videoListPath = path.join(manifestDir, `${job.id}-recover-video-parts.txt`);
+        const videoLines: string[] = [];
+        for (let i = 0; i < videoParts.length; i++) {
+          const p = path.join(partsDir, `part-${i}.bin`);
+          videoLines.push(`file '${p.replace(/'/g, "'\\''")}'`);
+        }
+        await fs.promises.writeFile(videoListPath, videoLines.join('\n'), 'utf8');
+        const videoConcatTmp = path.join(manifestDir, `${job.id}-recovered-video-concat.mp4`);
+        try { if (fs.existsSync(videoConcatTmp)) fs.unlinkSync(videoConcatTmp); } catch (e) {}
+        await this.ffmpeg.mergeParts(videoListPath, videoConcatTmp);
+
+        let audioCount = 0;
+        while (fs.existsSync(path.join(partsDir, `audio-part-${audioCount}.bin`))) audioCount += 1;
+        let audioConcatTmp: string | null = null;
+        if (audioCount > 0) {
+          const audioListPath = path.join(manifestDir, `${job.id}-recover-audio-parts.txt`);
+          const audioLines: string[] = [];
+          for (let i = 0; i < audioCount; i++) {
+            const p = path.join(partsDir, `audio-part-${i}.bin`);
+            audioLines.push(`file '${p.replace(/'/g, "'\\''")}'`);
+          }
+          await fs.promises.writeFile(audioListPath, audioLines.join('\n'), 'utf8');
+          audioConcatTmp = path.join(manifestDir, `${job.id}-recovered-audio-concat.mp4`);
+          try { if (fs.existsSync(audioConcatTmp)) fs.unlinkSync(audioConcatTmp); } catch (e) {}
+          await this.ffmpeg.mergeParts(audioListPath, audioConcatTmp);
+        }
+
+        if (mediaEffective === 'video') {
+          recoveryInputPath = videoConcatTmp;
+        } else if (mediaEffective === 'audio') {
+          if (!audioConcatTmp) return null;
+          recoveryInputPath = audioConcatTmp;
+        } else {
+          if (!audioConcatTmp) return null;
+          const mergedTmp = path.join(manifestDir, `${job.id}-recovered-merged.mp4`);
+          try { if (fs.existsSync(mergedTmp)) fs.unlinkSync(mergedTmp); } catch (e) {}
+          await this.ffmpeg.merge(videoConcatTmp, audioConcatTmp, mergedTmp);
+          recoveryInputPath = mergedTmp;
+        }
+      } else {
+        return null;
+      }
+
+      if (!recoveryInputPath || !fs.existsSync(recoveryInputPath)) return null;
+      const preparedOutput = await this.applyMediaModeOutput(
+        recoveryInputPath,
+        manifestDir,
+        String(job.id),
+        mediaEffective as MediaMode,
+      );
+      const ext = mediaEffective === 'audio' ? 'm4a' : 'mp4';
+      const finalDir = path.join(this.resultDir, platform, safeTitle);
+      try { if (!fs.existsSync(finalDir)) fs.mkdirSync(finalDir, { recursive: true }); } catch (e) {}
+      const finalPath = fs.existsSync(finalDir) ? path.join(finalDir, `${vid}-${job.id}.${ext}`) : preparedOutput;
+      if (finalPath !== preparedOutput) { try { fs.renameSync(preparedOutput, finalPath); } catch (e) {} }
+
+      await job.progress(100);
+      await this.history.appendEvent(String(job.id), {
+        state: 'finished',
+        progress: 100,
+        result: {
+          path: finalPath,
+          platform,
+          vid,
+          title,
+          mediaRequested,
+          mediaEffective,
+          mediaFallbackReason,
+          recoveredFromManifest: true,
+        },
+      });
+      this.cleanupJobTempArtifacts(String(job.id), finalPath);
+      this.logger.warn(`Job ${job.id}: recovered and finalized from completed manifest -> ${finalPath}`);
+      return {
+        path: finalPath,
+        platform,
+        vid,
+        title,
+        mediaRequested,
+        mediaEffective,
+        mediaFallbackReason,
+        recoveredFromManifest: true,
+      };
+    } catch {
+      return null;
+    }
+  }
+
+  private async tryFinalizeSingleModeArtifacts(
+    job: Job,
+    payload: any,
+    manifestDir: string,
+    manifestPath: string,
+  ): Promise<any | null> {
+    try {
+      let manifest: any = {};
+      if (fs.existsSync(manifestPath)) {
+        try {
+          const raw = await fs.promises.readFile(manifestPath, 'utf8');
+          manifest = JSON.parse(raw || '{}');
+        } catch {
+          manifest = {};
+        }
+      }
+
+      const strategy = String(manifest?.strategy || '');
+      if (strategy && strategy !== 'dash-single') return null;
+
+      const vid = String(manifest?.vid || payload?.vid || `job-${job.id}`);
+      const platform = String(manifest?.platform || payload?.platform || 'generic');
+      const title = String(manifest?.title || payload?.title || vid);
+      const safeTitle = String(manifest?.safeTitle || this.normalizeTitleForFolder(title));
+      const mediaRequested = String(manifest?.mediaRequested || payload?.mediaRequested || 'both');
+      const mediaEffective = String(manifest?.mediaEffective || mediaRequested);
+      const mediaFallbackReason = manifest?.mediaFallbackReason || null;
+
+      const videoTmp = path.join(this['dataDir'], `${job.id}-video`);
+      const audioTmp = path.join(this['dataDir'], `${job.id}-audio`);
+      const tempOutFile = path.join(this['dataDir'], `${vid}-${job.id}.mp4`);
+
+      let recoveryInputPath: string | null = null;
+      const hasVideoTmp = fs.existsSync(videoTmp) && (fs.statSync(videoTmp).size > 0);
+      const hasAudioTmp = fs.existsSync(audioTmp) && (fs.statSync(audioTmp).size > 0);
+      if (hasVideoTmp && hasAudioTmp) {
+        const mergedTmp = path.join(manifestDir, `${job.id}-recovered-single-merged.mp4`);
+        try { if (fs.existsSync(mergedTmp)) fs.unlinkSync(mergedTmp); } catch (e) {}
+        await this.ffmpeg.merge(videoTmp, audioTmp, mergedTmp);
+        recoveryInputPath = mergedTmp;
+      } else if (await this.shouldAcceptRecoveredSingleFile(String(job.id), tempOutFile)) {
+        recoveryInputPath = tempOutFile;
+      } else {
+        return null;
+      }
+
+      await this.history.appendEvent(String(job.id), { state: 'recovering-merge', progress: 90, from: 'single-artifacts' });
+      const preparedOutput = await this.applyMediaModeOutput(
+        recoveryInputPath,
+        manifestDir,
+        String(job.id),
+        mediaEffective as MediaMode,
+      );
+      const ext = mediaEffective === 'audio' ? 'm4a' : 'mp4';
+      const finalDir = path.join(this.resultDir, platform, safeTitle);
+      try { if (!fs.existsSync(finalDir)) fs.mkdirSync(finalDir, { recursive: true }); } catch (e) {}
+      const finalPath = fs.existsSync(finalDir) ? path.join(finalDir, `${vid}-${job.id}.${ext}`) : preparedOutput;
+      if (finalPath !== preparedOutput) { try { fs.renameSync(preparedOutput, finalPath); } catch (e) {} }
+
+      await job.progress(100);
+      await this.history.appendEvent(String(job.id), {
+        state: 'finished',
+        progress: 100,
+        result: {
+          path: finalPath,
+          platform,
+          vid,
+          title,
+          mediaRequested,
+          mediaEffective,
+          mediaFallbackReason,
+          recoveredFromSingleArtifacts: true,
+        },
+      });
+      this.cleanupJobTempArtifacts(String(job.id), finalPath);
+      this.logger.warn(`Job ${job.id}: recovered and finalized from single artifacts -> ${finalPath}`);
+      return {
+        path: finalPath,
+        platform,
+        vid,
+        title,
+        mediaRequested,
+        mediaEffective,
+        mediaFallbackReason,
+        recoveredFromSingleArtifacts: true,
+      };
+    } catch {
+      return null;
+    }
+  }
+
+  private async shouldAcceptRecoveredSingleFile(jobId: string, tempOutFile: string): Promise<boolean> {
+    try {
+      if (!fs.existsSync(tempOutFile)) return false;
+      const size = fs.statSync(tempOutFile).size;
+      if (size <= 0) return false;
+      const expected = await this.readJobTotalExpectedBytes(jobId);
+      if (expected <= 0) return true;
+      return size >= Math.floor(expected * 0.98);
+    } catch {
+      return false;
+    }
+  }
+
+  private async readJobTotalExpectedBytes(jobId: string): Promise<number> {
+    try {
+      const redisClient: any = (this.downloadQueue && (this.downloadQueue as any).client) ? (this.downloadQueue as any).client : null;
+      if (!redisClient || typeof redisClient.hget !== 'function') return 0;
+      const raw = await redisClient.hget(`job:parts:${jobId}`, 'totalExpectedBytes');
+      return parseInt(String(raw || '0'), 10) || 0;
+    } catch {
+      return 0;
     }
   }
 
@@ -1294,7 +1730,7 @@ return 1
   private adoptResumeArtifacts(
     job: Job,
     payload: any,
-    bvid: string,
+    vid: string,
     videoTmp?: string,
     audioTmp?: string,
     tempOutFile?: string,
@@ -1318,7 +1754,7 @@ return 1
     for (const sourceJobId of sources) {
       adopt(path.join(this['dataDir'], `${sourceJobId}-video`), videoTmp, `video partial from job ${sourceJobId}`);
       adopt(path.join(this['dataDir'], `${sourceJobId}-audio`), audioTmp, `audio partial from job ${sourceJobId}`);
-      adopt(path.join(this['dataDir'], `${bvid}-${sourceJobId}.mp4`), tempOutFile, `media partial from job ${sourceJobId}`);
+      adopt(path.join(this['dataDir'], `${vid}-${sourceJobId}.mp4`), tempOutFile, `media partial from job ${sourceJobId}`);
       const done = (videoTmp && fs.existsSync(videoTmp)) || (audioTmp && fs.existsSync(audioTmp)) || (tempOutFile && fs.existsSync(tempOutFile));
       if (done) break;
     }
@@ -1526,70 +1962,29 @@ return 1
     }
   }
 
-  private async fetchVideoTitle(bvid: string, cookies?: string): Promise<string | null> {
+  private async fetchVideoTitle(vid: string, cookies?: string): Promise<string | null> {
     try {
       const headers: Record<string, string> = {};
       if (cookies) headers.Cookie = cookies;
-      const resp = await axios.get('https://api.bilibili.com/x/web-interface/view', { params: { bvid }, headers, timeout: 5000 });
+      const resp = await axios.get('https://api.bilibili.com/x/web-interface/view', { params: { vid }, headers, timeout: 5000 });
       return resp.data?.data?.title || null;
     } catch (e) {
-      this.logger.warn(`Failed to fetch video title for ${bvid}: ${e instanceof Error ? e.message : String(e)}`);
+      this.logger.warn(`Failed to fetch video title for ${vid}: ${e instanceof Error ? e.message : String(e)}`);
       return null;
     }
   }
 
-  private loadCookiesFromConfig(): string {
-    const cookieFile = path.join(process.cwd(), 'config', 'cookies.json');
-    try {
-      if (!fs.existsSync(cookieFile)) return '';
-      const raw = fs.readFileSync(cookieFile, 'utf8').trim();
-      if (!raw) return '';
-
-      // Support browser-export format: [{ name, value, ... }, ...]
-      if (raw.startsWith('[')) {
-        const arr = JSON.parse(raw);
-        if (Array.isArray(arr)) {
-          const pairs = arr
-            .map((c: any) => {
-              const name = String(c?.name || '').trim();
-              const value = String(c?.value || '').trim();
-              if (!name) return '';
-              return `${name}=${value}`;
-            })
-            .filter(Boolean);
-          return pairs.join('; ');
-        }
-      }
-
-      // Support object map format: { "SESSDATA": "...", ... }
-      if (raw.startsWith('{')) {
-        const obj = JSON.parse(raw);
-        if (obj && typeof obj === 'object') {
-          const pairs = Object.entries(obj)
-            .map(([k, v]) => `${String(k).trim()}=${String(v ?? '').trim()}`)
-            .filter((s) => !s.startsWith('='));
-          return pairs.join('; ');
-        }
-      }
-
-      // Support plain cookie string
-      return raw;
-    } catch (e) {
-      this.logger.warn(`Failed to load cookies from config/cookies.json: ${e instanceof Error ? e.message : String(e)}`);
-      return '';
-    }
-  }
-
   private async acquireMasterSlot(job: Job): Promise<void> {
-    if (WorkerProcessor.activeMasterJobs < this.masterConcurrency) {
-      WorkerProcessor.activeMasterJobs += 1;
-      this.logger.debug(`Job ${job.id}: acquired master slot (${WorkerProcessor.activeMasterJobs}/${this.masterConcurrency})`);
-      return;
+    while (true) {
+      const masterConcurrency = this.getCurrentMasterConcurrency();
+      if (WorkerProcessor.activeMasterJobs < masterConcurrency) {
+        WorkerProcessor.activeMasterJobs += 1;
+        this.logger.debug(`Job ${job.id}: acquired master slot (${WorkerProcessor.activeMasterJobs}/${masterConcurrency})`);
+        return;
+      }
+      this.logger.debug(`Job ${job.id}: waiting master slot (${WorkerProcessor.activeMasterJobs}/${masterConcurrency})`);
+      await new Promise<void>((resolve) => setTimeout(resolve, 250));
     }
-    this.logger.debug(`Job ${job.id}: waiting master slot (${WorkerProcessor.activeMasterJobs}/${this.masterConcurrency})`);
-    await new Promise<void>((resolve) => WorkerProcessor.masterWaiters.push(resolve));
-    WorkerProcessor.activeMasterJobs += 1;
-    this.logger.debug(`Job ${job.id}: acquired master slot after wait (${WorkerProcessor.activeMasterJobs}/${this.masterConcurrency})`);
   }
 
   private releaseMasterSlot(): void {
@@ -1599,13 +1994,14 @@ return 1
   }
 
   private async acquireSingleDownloadPermit(job: Job): Promise<string | null> {
-    if (this.globalSingleMaxConcurrentDownloads <= 0) return null;
     const redisClient: any = (this.downloadQueue && (this.downloadQueue as any).client) ? (this.downloadQueue as any).client : null;
-    if (!redisClient || typeof redisClient.eval !== 'function') {
-      throw new Error(`single-download limiter enabled but redis eval is unavailable for job ${job.id}`);
-    }
     const token = `single-${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2)}-${job.id}`;
     while (true) {
+      const limiter = this.getCurrentSingleLimiterConfig();
+      if (limiter.maxConcurrent <= 0) return null;
+      if (!redisClient || typeof redisClient.eval !== 'function') {
+        throw new Error(`single-download limiter enabled but redis eval is unavailable for job ${job.id}`);
+      }
       const now = Date.now();
       let ok = 0;
       try {
@@ -1614,8 +2010,8 @@ return 1
           1,
           WorkerProcessor.GLOBAL_SINGLE_DOWNLOADS_SEMAPHORE_KEY,
           String(now),
-          String(this.limiterLeaseMs),
-          String(this.globalSingleMaxConcurrentDownloads),
+          String(limiter.leaseMs),
+          String(limiter.maxConcurrent),
           token,
         )) || 0;
       } catch (e) {
@@ -1626,20 +2022,22 @@ return 1
         this.logger.debug(`Job ${job.id}: acquired single-download permit (${token})`);
         return token;
       }
-      await new Promise((r) => setTimeout(r, this.limiterWaitMs));
+      await new Promise((r) => setTimeout(r, limiter.waitMs));
     }
   }
 
   private startPermitRenew(token: string, redisClient: any): void {
-    const period = Math.max(1000, Math.floor(this.limiterLeaseMs / 3));
+    const base = this.getCurrentSingleLimiterConfig();
+    const period = Math.max(1000, Math.floor(base.leaseMs / 3));
     const t = setInterval(async () => {
       try {
+        const limiter = this.getCurrentSingleLimiterConfig();
         await redisClient.eval(
           WorkerProcessor.RENEW_GLOBAL_PERMIT_LUA,
           1,
           WorkerProcessor.GLOBAL_SINGLE_DOWNLOADS_SEMAPHORE_KEY,
           String(Date.now()),
-          String(this.limiterLeaseMs),
+          String(limiter.leaseMs),
           token,
         );
       } catch (e) {
@@ -1668,5 +2066,19 @@ return 1
     } catch (e) {
       // ignore release errors
     }
+  }
+
+  private getCurrentMasterConcurrency(): number {
+    const workerConcurrency = Math.max(1, Number(this.runtimeConfig.getGlobal('worker.concurrency') ?? 4));
+    const singleMax = Math.max(1, Number(this.runtimeConfig.getGlobal('download.singleMaxConcurrentDownloads') ?? process.env.SINGLE_MAX_CONCURRENT_DOWNLOADS ?? 5));
+    return Math.min(workerConcurrency, singleMax);
+  }
+
+  private getCurrentSingleLimiterConfig(): { maxConcurrent: number; leaseMs: number; waitMs: number } {
+    return {
+      maxConcurrent: Math.max(0, Number(this.runtimeConfig.getGlobal('download.globalSingleMaxConcurrentDownloads') ?? process.env.GLOBAL_SINGLE_MAX_CONCURRENT_DOWNLOADS ?? 5)),
+      leaseMs: Math.max(5000, Number(this.runtimeConfig.getGlobal('download.globalLimiterLeaseMs') ?? process.env.GLOBAL_LIMITER_LEASE_MS ?? 120000)),
+      waitMs: Math.max(100, Number(this.runtimeConfig.getGlobal('download.globalLimiterWaitMs') ?? process.env.GLOBAL_LIMITER_WAIT_MS ?? 300)),
+    };
   }
 }

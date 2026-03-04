@@ -6,7 +6,7 @@ Source of truth for Cursor, Codex, and Antigravity AI.
 ### 1) Purpose
 
 - Project: `video-creator` (NestJS + Bull + Redis + FFmpeg).
-- Goal: accept Bilibili URL/BVID, run background downloads, and write final `.mp4` under `data/`.
+- Goal: accept multi-platform video/page URLs (Bilibili, YouTube, generic), run background downloads, and write final media files under `result/`.
 - Persistence:
   - Queue/job state in Bull + Redis.
   - Durable artifacts/history in filesystem (`data/`, `logs/`).
@@ -35,9 +35,9 @@ Source of truth for Cursor, Codex, and Antigravity AI.
 ### 4) Request and Processing Flow
 
 1. Client calls `POST /download` with `CreateDownloadDto` (`url` required, `title` optional).
-2. [`DownloadController.startDownload()`](/Users/danielpham/sync-workspace/05_Stories/video-creator/src/download/download.controller.ts) extracts `bvid`, then enqueues a `downloads` job.
-3. Worker resolves `cid` and play URL via [`PlayurlService`](/Users/danielpham/sync-workspace/05_Stories/video-creator/src/playurl/playurl.service.ts).
-   - Enforces Full HD policy: resolved quality must be `qn >= download.minVideoQn` (default `80`).
+2. [`DownloadController.startDownload()`](/Users/danielpham/sync-workspace/05_Stories/video-creator/src/download/download.controller.ts) accepts URL + optional `platform` and `media`, then enqueues a `downloads` job with normalized `vid`.
+3. Worker resolves streams via platform handlers in `src/source/`.
+   - Bilibili resolver still uses playurl APIs and enforces Full HD policy (`qn >= download.minVideoQn`, default `80`).
 4. Worker selects strategy in this order:
    - `dash-segmented`
    - `dash-byte-range`
@@ -45,13 +45,13 @@ Source of truth for Cursor, Codex, and Antigravity AI.
    - `dash-single`
    - `durl` (single file)
 5. Parts (if any) are merged, then video/audio merged by [`FfmpegService`](/Users/danielpham/sync-workspace/05_Stories/video-creator/src/ffmpeg/ffmpeg.service.ts).
-6. Final output: `result/bilibili/<safeTitle>/<bvid>-<jobId>.mp4`.
+6. Final output: `result/<platform>/<safeTitle>/<vid>-<jobId>.<ext>` where `<ext>` is `.mp4` or `.m4a`.
 7. History events are appended to `data/jobs/<jobId>.json`.
 
 ### 5) Public API (Current)
 
 - `POST /download`
-  - Body: `{ url: string, title?: string }`
+  - Body: `{ url: string, title?: string, platform?: 'auto'|'bilibili'|'youtube'|'generic', media?: 'both'|'video'|'audio' }`
   - Response: `{ jobId }`
 - `GET /download/status/:id`
   - Returns job state/progress/failure/result/history + parts summary (from Redis hash `job:parts:<id>` when present).
@@ -91,8 +91,8 @@ Source of truth for Cursor, Codex, and Antigravity AI.
 
 ### 8) Filesystem Layout
 
-- `data/`
-  - `bilibili/<safeTitle>/<bvid>-<jobId>.mp4`
+- `result/`
+  - `<platform>/<safeTitle>/<vid>-<jobId>.<ext>`
   - `<jobId>.cancel`, `<jobId>.stop`
   - `<jobId>/manifest.json`
   - `<jobId>/parts/part-<i>.bin`, `audio-part-<i>.bin`
@@ -120,7 +120,7 @@ Source of truth for Cursor, Codex, and Antigravity AI.
 
 ### 10) Configuration Source
 
-- Human-readable config: [`config/config.yaml`](/Users/danielpham/sync-workspace/05_Stories/video-creator/config/config.yaml).
+- Human-readable config: [`config/config.default.yaml`](/Users/danielpham/sync-workspace/05_Stories/video-creator/config/config.default.yaml) with source overrides in `config/config.<source>.yaml`.
 - Loader: [`src/config/config.loader.ts`](/Users/danielpham/sync-workspace/05_Stories/video-creator/src/config/config.loader.ts).
 - Key sections:
   - `redis.*`
@@ -133,6 +133,6 @@ Source of truth for Cursor, Codex, and Antigravity AI.
 ### 11) Current Invariants
 
 - Queue names are fixed: `downloads`, `download-parts`.
-- Final file naming stays `<bvid>-<jobId>.mp4` inside normalized title folder.
-- Cookies are read from `config/cookies.json` by worker.
+- Final file naming stays `<vid>-<jobId>.<ext>` inside normalized title folder.
+- Cookies are read from `config/cookies/<source>.json` by worker.
 - `GET /download/status/:id` is canonical status endpoint.

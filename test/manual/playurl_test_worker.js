@@ -4,7 +4,7 @@ const axios = require('axios');
 (async () => {
   try {
     const bvid = process.argv[2] || 'BV1Nif2BHE3d';
-    const cookiesArr = JSON.parse(fs.readFileSync('config/cookies.json', 'utf8'));
+    const cookiesArr = JSON.parse(fs.readFileSync('config/cookies/bilibili.json', 'utf8'));
     const cookieStr = cookiesArr.map(c => `${c.name}=${c.value}`).join('; ');
 
     console.log('Fetching pagelist for', bvid);

@@ -6,6 +6,7 @@ import { JobsModule } from '../jobs/jobs.module';
 import { PlayurlModule } from '../playurl/playurl.module';
 import { FfmpegModule } from '../ffmpeg/ffmpeg.module';
 import { AppConfigModule } from '../config/config.module';
+import { SourceModule } from '../source/source.module';
 
 @Module({
   imports: [
@@ -17,6 +18,7 @@ import { AppConfigModule } from '../config/config.module';
     JobsModule,
     PlayurlModule,
     FfmpegModule,
+    SourceModule,
   ],
   controllers: [DownloadController],
   providers: [DownloadService],

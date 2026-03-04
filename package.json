@@ -13,6 +13,7 @@
     "lint": "eslint \"src/**/*.{ts,js}\" --fix"
   },
   "dependencies": {
+    "@distube/ytdl-core": "^4.16.12",
     "@nestjs/config": "^3.0.0",
     "js-yaml": "^4.1.0",
     "@nestjs/bull": "^11.0.4",
@@ -30,7 +31,8 @@
     "ffmpeg-static": "^5.1.0",
     "fluent-ffmpeg": "^2.1.2",
     "ioredis": "^5.0.0",
-    "swagger-ui-express": "^5.0.1"
+    "swagger-ui-express": "^5.0.1",
+    "ytdl-core": "^4.11.5"
   },
   "devDependencies": {
     "@nestjs/cli": "^10.0.0",

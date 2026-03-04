@@ -4,7 +4,7 @@ import * as yaml from 'js-yaml';
 
 export default function loadYamlConfig() {
   try {
-    const cfgPath = path.join(process.cwd(), 'config', 'config.yaml');
+    const cfgPath = path.join(process.cwd(), 'config', 'config.default.yaml');
     if (!fs.existsSync(cfgPath)) return {};
     const raw = fs.readFileSync(cfgPath, 'utf8');
     const parsed = yaml.load(raw) as Record<string, any> | undefined;

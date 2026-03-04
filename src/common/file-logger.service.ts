@@ -2,7 +2,7 @@ import { LoggerService } from '@nestjs/common';
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
-import loadYamlConfig from '../config/config.loader';
+import { runtimeConfigEngine } from '../config/runtime-config.engine';
 
 type Level = 'info' | 'warn' | 'error' | 'debug';
 
@@ -47,14 +47,18 @@ export class FileLoggerService implements LoggerService {
   private readonly aggregateErrorPath: string | null;
   private readonly aggregateDebugPath: string | null;
   private readonly archiveDir: string;
-  private readonly rotate: RotateConfig;
+  private rotate: RotateConfig;
 
   private lastRotateCheckAt = 0;
   private isRotating = false;
+  private unsubscribeRuntimeConfig: (() => void) | null = null;
 
   constructor() {
-    const cfg = loadYamlConfig() as any;
-    this.rotate = this.resolveRotateConfig(cfg);
+    runtimeConfigEngine.start();
+    this.rotate = this.resolveRotateConfig(runtimeConfigEngine.getGlobal());
+    this.unsubscribeRuntimeConfig = runtimeConfigEngine.subscribe(() => {
+      this.rotate = this.resolveRotateConfig(runtimeConfigEngine.getGlobal());
+    });
 
     const root = path.resolve(process.cwd(), 'logs');
     this.archiveDir = path.join(root, 'archived');

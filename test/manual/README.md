@@ -12,7 +12,7 @@ Files and quick usage
 
 - `playurl_test_worker.js`
   - Purpose: fetch Bilibili `pagelist` and `playurl` endpoints and print the JSON response.
-  - Prereqs: `config/cookies.json` must exist and contain an array of cookie objects.
+  - Prereqs: `config/cookies/bilibili.json` must exist and contain an array of cookie objects.
   - Run: `node test/manual/playurl_test_worker.js [BV_ID]`
 
 - `poll_job.js`

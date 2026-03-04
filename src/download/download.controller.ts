@@ -3,10 +3,13 @@ import { InjectQueue } from '@nestjs/bull';
 import { Queue } from 'bull';
 import { DownloadService } from './download.service';
 import { CreateDownloadDto } from './dto/create-download.dto';
-import { ApiBody } from '@nestjs/swagger';
+import { ApiBody, ApiOperation, ApiParam } from '@nestjs/swagger';
+import { downloadSwagger } from './download.swagger';
 import { JobHistoryService } from '../jobs/job-history.service';
 import { FfmpegService } from '../ffmpeg/ffmpeg.service';
-import { ConfigService } from '@nestjs/config';
+import { RuntimeConfigService } from '../config/runtime-config.service';
+import { SourceRegistryService } from '../source/source-registry.service';
+import { ConcretePlatform, MediaMode, Platform } from '../source/source.types';
 
 import * as path from 'path';
 import * as fs from 'fs';
@@ -19,45 +22,44 @@ export class DownloadController {
     @InjectQueue('download-parts') private readonly partsQueue: Queue,
     private readonly history: JobHistoryService,
     private readonly ffmpeg: FfmpegService,
-    private readonly config: ConfigService,
+    private readonly runtimeConfig: RuntimeConfigService,
+    private readonly sourceRegistry: SourceRegistryService,
   ) {}
 
   @Post()
-  @ApiBody({ type: CreateDownloadDto })
+  @ApiOperation(downloadSwagger.post.startDownload.operation)
+  @ApiBody(downloadSwagger.post.startDownload.body)
   async startDownload(@Body() payload: CreateDownloadDto) {
-    // Normalize incoming body: accept either a `bvid` already, or a `url` containing a BV id.
-    let bvid: string | undefined = (payload as any).bvid;
+    const url = String(payload.url || '').trim();
+    if (!url) {
+      throw new BadRequestException('url is required');
+    }
     let page = 1;
-    if (!bvid && payload.url) {
-      const u = String(payload.url || '');
-      // try to find BV id in common Bilibili URL forms
-      const m1 = u.match(/BV[0-9A-Za-z]+/);
-      const m2 = u.match(/[?&]bvid=(BV[0-9A-Za-z]+)/);
-      const pm = u.match(/[?&]p=(\d+)/);
-      if (m1) bvid = m1[0];
-      else if (m2) bvid = m2[1];
-      if (pm) {
-        const parsedPage = parseInt(pm[1], 10);
-        if (Number.isFinite(parsedPage) && parsedPage >= 1) page = parsedPage;
-      }
+    const urlPage = url.match(/[?&]p=(\d+)/);
+    if (urlPage && Number.isFinite(Number(urlPage[1])) && Number(urlPage[1]) >= 1) {
+      page = Math.floor(Number(urlPage[1]));
     }
-
     const explicitPage = Number((payload as any).p);
-    if (Number.isFinite(explicitPage) && explicitPage >= 1) {
-      page = Math.floor(explicitPage);
-    }
+    if (Number.isFinite(explicitPage) && explicitPage >= 1) page = Math.floor(explicitPage);
 
-    if (!bvid) {
-      // If caller didn't provide a bvid or a url containing one, reject the request
-      throw new BadRequestException('bvid missing from request; provide a Bilibili video URL or bvid');
-    }
-
-    const jobPayload: any = { bvid, url: payload.url, title: payload.title, page };
+    const platform = (payload.platform || 'auto') as Platform;
+    const mediaRequested = (payload.media || 'both') as MediaMode;
+    const identity = this.sourceRegistry.identifyInput(url, platform);
+    const jobPayload: any = {
+      platform: identity.platform,
+      mediaRequested,
+      vid: identity.vid,
+      url,
+      title: payload.title,
+      page,
+    };
     const job = await this.downloadService.enqueue(jobPayload);
     return { jobId: job.id };
   }
 
   @Get('status/:id')
+  @ApiOperation(downloadSwagger.get.getStatus.operation)
+  @ApiParam(downloadSwagger.get.getStatus.idParam)
   async getStatus(@Param('id') id: string) {
     const job = await this.downloadQueue.getJob(id as any);
     if (!job) return { id, state: 'not-found' };
@@ -107,14 +109,16 @@ export class DownloadController {
   }
 
   @Post(':id/resume')
+  @ApiOperation(downloadSwagger.post.resume.operation)
+  @ApiParam(downloadSwagger.post.resume.idParam)
   async resume(@Param('id') id: string) {
     const job = await this.downloadQueue.getJob(id as any);
     if (!job) throw new NotFoundException('job not found');
     const data = job.data || {};
-    const bvid = data.bvid;
-    if (!bvid) throw new NotFoundException('bvid missing from job data');
+    const vid = data.vid;
+    if (!vid) throw new NotFoundException('vid missing from job data');
 
-    const cfgDataDir = String(this.config.get('download.dataDir') || path.join(process.cwd(), 'data'));
+    const cfgDataDir = String(this.runtimeConfig.getGlobal('download.dataDir') || path.join(process.cwd(), 'data'));
     const DATA_DIR = path.isAbsolute(cfgDataDir) ? cfgDataDir : path.resolve(process.cwd(), cfgDataDir);
     const stopKey = `job:stop:${id}`;
     const cancelKey = `job:cancel:${id}`;
@@ -196,8 +200,12 @@ export class DownloadController {
     let newJob: any = null;
       try {
         await this.history.appendEvent(id, { state: 'requeueing', progress: 0 });
-        const retryCount = Number(this.config.get('download.retryCount') ?? 3);
-        const retryBackoffMs = Number(this.config.get('download.retryBackoffMs') ?? 5000);
+        const rawPlatform = String((data as any)?.platform || 'generic').toLowerCase();
+        const platform: ConcretePlatform = rawPlatform === 'bilibili' || rawPlatform === 'youtube' || rawPlatform === 'generic'
+          ? (rawPlatform as ConcretePlatform)
+          : 'generic';
+        const retryCount = Number(this.runtimeConfig.getForSource(platform, 'download.retryCount') ?? 3);
+        const retryBackoffMs = Number(this.runtimeConfig.getForSource(platform, 'download.retryBackoffMs') ?? 5000);
         const prevIds: string[] = [];
         if ((data as any)?.resumeFromJobId) prevIds.push(String((data as any).resumeFromJobId));
         if (Array.isArray((data as any)?.resumeFromJobIds)) {
@@ -235,9 +243,11 @@ export class DownloadController {
   }
 
   @Post(':id/cancel')
+  @ApiOperation(downloadSwagger.post.cancel.operation)
+  @ApiParam(downloadSwagger.post.cancel.idParam)
   async cancel(@Param('id') id: string) {
     const job = await this.downloadQueue.getJob(id as any);
-    const cfgDataDir = String(this.config.get('download.dataDir') || path.join(process.cwd(), 'data'));
+    const cfgDataDir = String(this.runtimeConfig.getGlobal('download.dataDir') || path.join(process.cwd(), 'data'));
     const DATA_DIR = path.isAbsolute(cfgDataDir) ? cfgDataDir : path.resolve(process.cwd(), cfgDataDir);
     const cancelFile = path.join(DATA_DIR, `${id}.cancel`);
     try {
@@ -275,11 +285,13 @@ export class DownloadController {
   }
 
   @Post(':id/merge-partial')
+  @ApiOperation(downloadSwagger.post.mergePartial.operation)
+  @ApiParam(downloadSwagger.post.mergePartial.idParam)
   async mergePartial(@Param('id') id: string) {
     const jobId = String(id);
-    const cfgDataDir = String(this.config.get('download.dataDir') || path.join(process.cwd(), 'data'));
+    const cfgDataDir = String(this.runtimeConfig.getGlobal('download.dataDir') || path.join(process.cwd(), 'data'));
     const DATA_DIR = path.isAbsolute(cfgDataDir) ? cfgDataDir : path.resolve(process.cwd(), cfgDataDir);
-    const cfgResultDir = String(this.config.get('download.resultDir') || path.join(process.cwd(), 'result'));
+    const cfgResultDir = String(this.runtimeConfig.getGlobal('download.resultDir') || path.join(process.cwd(), 'result'));
     const RESULT_DIR = path.isAbsolute(cfgResultDir) ? cfgResultDir : path.resolve(process.cwd(), cfgResultDir);
     const manifestDir = path.join(DATA_DIR, jobId);
     const manifestPath = path.join(manifestDir, 'manifest.json');
@@ -295,10 +307,11 @@ export class DownloadController {
       throw new BadRequestException('invalid manifest for job');
     }
 
-    const bvid: string = manifest?.bvid;
-    if (!bvid) throw new BadRequestException('manifest missing bvid');
+    const vid: string = manifest?.vid;
+    if (!vid) throw new BadRequestException('manifest missing vid');
+    const platform: string = String(manifest?.platform || 'generic');
 
-    const title: string = manifest?.title || bvid;
+    const title: string = manifest?.title || vid;
     const safeTitle = this.sanitizeTitle(title);
 
     // Currently partial merge is only meaningful for byte-range (durl) strategy.
@@ -347,14 +360,14 @@ export class DownloadController {
     }
     outStream.end();
 
-    const finalDir = path.join(RESULT_DIR, 'bilibili', safeTitle);
+    const finalDir = path.join(RESULT_DIR, platform, safeTitle);
     try {
       if (!fs.existsSync(finalDir)) fs.mkdirSync(finalDir, { recursive: true });
     } catch (e) {
       // ignore
     }
     const finalPath = fs.existsSync(finalDir)
-      ? path.join(finalDir, `${bvid}-${jobId}-partial.mp4`)
+      ? path.join(finalDir, `${vid}-${jobId}-partial.mp4`)
       : partialTmp;
     if (finalPath !== partialTmp) {
       try {
@@ -369,7 +382,7 @@ export class DownloadController {
       progress: 100,
       result: {
         path: finalPath,
-        bvid,
+        vid,
         title,
         mergedParts: prefixCount,
         totalParts: parts.length,

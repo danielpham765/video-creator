@@ -3,14 +3,15 @@ import { Processor, Process, InjectQueue } from '@nestjs/bull';
 import { Job, Queue } from 'bull';
 import * as fs from 'fs';
 import * as path from 'path';
-import { ConfigService } from '@nestjs/config';
 import resumeDownload, { ProgressCallback, ResumeDownloadResult } from '../utils/resume-download';
 import { formatMb, formatMbProgress } from '../utils/size-format';
 import { formatElapsedDuration } from '../utils/duration-format';
+import { RuntimeConfigService } from '../config/runtime-config.service';
+import { ConcretePlatform } from '../source/source.types';
 
 export interface PartJobData {
   jobId: string;
-  bvid: string;
+  vid: string;
   totalJobCount?: number;
   // for byte-range parts
   url?: string;
@@ -22,6 +23,7 @@ export interface PartJobData {
   expectedBytes: number;
   headers?: Record<string, string>;
   role?: 'video' | 'audio';
+  platform?: ConcretePlatform;
 }
 
 const GLOBAL_PARTS_SEMAPHORE_KEY = 'semaphore:downloads:parallel:global';
@@ -77,23 +79,15 @@ export class PartsProcessor {
   private readonly logger = new Logger(PartsProcessor.name);
   private static activePartJobs = 0;
   private static partWaiters: Array<() => void> = [];
-  private readonly parallelMaxConcurrentDownloads: number;
-  private readonly globalParallelMaxConcurrentDownloads: number;
-  private readonly globalLimiterLeaseMs: number;
-  private readonly globalLimiterWaitMs: number;
   private readonly partOwnerWaitTimeoutMs: number;
   private readonly partOwnerPollMs: number;
   private readonly renewTimers = new Map<string, NodeJS.Timeout>();
 
-  constructor(@InjectQueue('download-parts') private readonly partsQueue: Queue, private readonly config: ConfigService) {
-    const cfgDataDir = String(this.config.get('download.dataDir') || path.join(process.cwd(), 'data'));
+  constructor(@InjectQueue('download-parts') private readonly partsQueue: Queue, private readonly runtimeConfig: RuntimeConfigService) {
+    const cfgDataDir = String(this.runtimeConfig.getGlobal('download.dataDir') || path.join(process.cwd(), 'data'));
     this['dataDir'] = path.isAbsolute(cfgDataDir) ? cfgDataDir : path.resolve(process.cwd(), cfgDataDir);
-    this.parallelMaxConcurrentDownloads = Math.max(1, Number(this.config.get('download.parallelMaxConcurrentDownloads') ?? process.env.PARALLEL_MAX_CONCURRENT_DOWNLOADS ?? 10));
-    this.globalParallelMaxConcurrentDownloads = Math.max(0, Number(this.config.get('download.globalParallelMaxConcurrentDownloads') ?? process.env.GLOBAL_PARALLEL_MAX_CONCURRENT_DOWNLOADS ?? 10));
-    this.globalLimiterLeaseMs = Math.max(5000, Number(this.config.get('download.globalLimiterLeaseMs') ?? process.env.GLOBAL_LIMITER_LEASE_MS ?? 120000));
-    this.globalLimiterWaitMs = Math.max(100, Number(this.config.get('download.globalLimiterWaitMs') ?? process.env.GLOBAL_LIMITER_WAIT_MS ?? 300));
-    this.partOwnerWaitTimeoutMs = Math.max(5000, Number(this.config.get('download.partOwnerWaitTimeoutMs') ?? process.env.PART_OWNER_WAIT_TIMEOUT_MS ?? 180000));
-    this.partOwnerPollMs = Math.max(200, Number(this.config.get('download.partOwnerPollMs') ?? process.env.PART_OWNER_POLL_MS ?? 750));
+    this.partOwnerWaitTimeoutMs = Math.max(5000, Number(this.runtimeConfig.getGlobal('download.partOwnerWaitTimeoutMs') ?? process.env.PART_OWNER_WAIT_TIMEOUT_MS ?? 180000));
+    this.partOwnerPollMs = Math.max(200, Number(this.runtimeConfig.getGlobal('download.partOwnerPollMs') ?? process.env.PART_OWNER_POLL_MS ?? 750));
     if (!fs.existsSync(this['dataDir'])) fs.mkdirSync(this['dataDir'], { recursive: true });
   }
 
@@ -103,7 +97,11 @@ export class PartsProcessor {
     const partStartedAt = Date.now();
     try {
       const data = job.data;
-      const { jobId, bvid, totalJobCount, url, partIndex, rangeStart, rangeEnd, segmentUrls, expectedBytes, headers, role } = data as any;
+      const { jobId, vid, totalJobCount, url, partIndex, rangeStart, rangeEnd, segmentUrls, expectedBytes, headers, role } = data as any;
+      const rawPlatform = String((data as any)?.platform || 'generic').toLowerCase();
+      const platform: ConcretePlatform = rawPlatform === 'bilibili' || rawPlatform === 'youtube' || rawPlatform === 'generic'
+        ? (rawPlatform as ConcretePlatform)
+        : 'generic';
       const redisClientForSignal: any =
         (this.partsQueue && (this.partsQueue as any).client) ? (this.partsQueue as any).client : null;
       const resolvedTotalJobCount =
@@ -130,7 +128,7 @@ export class PartsProcessor {
       if (shouldAbort) {
         this.logger.log(`Job ${jobId} part ${partIndex}: skipped because master is stop/cancel requested`);
         await job.progress(100).catch(() => undefined);
-        return { jobId, bvid, partIndex, skipped: true };
+        return { jobId, vid, partIndex, skipped: true };
       }
 
       const partsDir = path.join(this['dataDir'], String(jobId), 'parts');
@@ -155,7 +153,7 @@ export class PartsProcessor {
       });
       if (!owner.acquired) {
         await job.progress(100).catch(() => undefined);
-        return { jobId, bvid, partIndex, deduped: true };
+        return { jobId, vid, partIndex, deduped: true };
       }
 
       try {
@@ -176,7 +174,7 @@ export class PartsProcessor {
                 } catch (e) {}
               }
               await job.progress(100).catch(() => undefined);
-              return { jobId, bvid, partIndex, path: partPath, bytes: existingSize, expectedBytes };
+              return { jobId, vid, partIndex, path: partPath, bytes: existingSize, expectedBytes };
             }
             fs.unlinkSync(partPath);
           }
@@ -228,12 +226,12 @@ export class PartsProcessor {
               // download each segment into a tmp file
                 try {
                 this.logger.debug(`Downloading segment ${si} for job ${jobId} part ${partIndex}: ${segUrl}`);
-                if (!this.config.get('download.resumeEnabled')) {
+                if (!this.runtimeConfig.getForSource(platform, 'download.resumeEnabled')) {
                   try { if (fs.existsSync(segTmp)) fs.unlinkSync(segTmp); } catch (e) {}
                 }
                 await resumeDownload(segUrl, segTmp, reqHeaders, path.join(this['dataDir'], `${jobId}.cancel`), undefined, onProgress, false, {
-                  timeoutMs: Number(this.config.get('download.timeoutMs') ?? 30000),
-                  proxy: String(this.config.get('proxy.http') || this.config.get('proxy.https') || '' ) || undefined,
+                  timeoutMs: Number(this.runtimeConfig.getForSource(platform, 'download.timeoutMs') ?? 30000),
+                  proxy: String(this.runtimeConfig.getForSource(platform, 'proxy.http') || this.runtimeConfig.getForSource(platform, 'proxy.https') || '' ) || undefined,
                   logger: this.logger,
                 });
               } catch (e) {
@@ -265,13 +263,13 @@ export class PartsProcessor {
           }
           this.logger.log(`Job ${jobId} part ${partIndex}/${displayTotalJobCount} completed (${formatMbProgress(finalSize, expectedBytes)}) in ${formatElapsedDuration(Date.now() - partStartedAt)}`);
           this.logger.debug(`Part ${partIndex} wrote ${formatMb(finalSize)} MB to ${partPath}`);
-          return { jobId, bvid, partIndex, path: partPath, bytes: finalSize, expectedBytes };
+          return { jobId, vid, partIndex, path: partPath, bytes: finalSize, expectedBytes };
         }
 
         // byte-range path
         this.logger.log(`Job ${jobId} part ${partIndex}/${displayTotalJobCount}: downloading bytes ${rangeStart}-${rangeEnd}`);
         // this.logger.debug(`Byte-range download headers: ${JSON.stringify(reqHeaders)}`);
-        if (!this.config.get('download.resumeEnabled')) {
+        if (!this.runtimeConfig.getForSource(platform, 'download.resumeEnabled')) {
           try { if (fs.existsSync(partPath)) fs.unlinkSync(partPath); } catch (e) {}
         }
         // Ensure byte-range jobs request only their assigned slice.
@@ -288,8 +286,8 @@ export class PartsProcessor {
           onProgress,
           true,
           {
-            timeoutMs: Number(this.config.get('download.timeoutMs') ?? 30000),
-            proxy: String(this.config.get('proxy.http') || this.config.get('proxy.https') || '') || undefined,
+            timeoutMs: Number(this.runtimeConfig.getForSource(platform, 'download.timeoutMs') ?? 30000),
+            proxy: String(this.runtimeConfig.getForSource(platform, 'proxy.http') || this.runtimeConfig.getForSource(platform, 'proxy.https') || '') || undefined,
             logger: this.logger,
           },
         );
@@ -321,7 +319,7 @@ export class PartsProcessor {
 
         return {
           jobId,
-          bvid,
+          vid,
           partIndex,
           path: partPath,
           bytes: finalSize,
@@ -422,35 +420,25 @@ export class PartsProcessor {
   }
 
   private async acquirePartSlot(job: Job<PartJobData>): Promise<string | null> {
-    if (PartsProcessor.activePartJobs < this.parallelMaxConcurrentDownloads) {
-      PartsProcessor.activePartJobs += 1;
-      try {
-        const permit = await this.acquireGlobalPermit(job);
-        this.logger.debug(
-          `Part queue job ${job.id}: acquired part slot (${PartsProcessor.activePartJobs}/${this.parallelMaxConcurrentDownloads})`,
-        );
-        return permit;
-      } catch (e) {
-        PartsProcessor.activePartJobs = Math.max(0, PartsProcessor.activePartJobs - 1);
-        const next = PartsProcessor.partWaiters.shift();
-        if (next) next();
-        throw e;
+    while (true) {
+      const parallelMaxConcurrentDownloads = this.getCurrentPartConcurrency();
+      if (PartsProcessor.activePartJobs < parallelMaxConcurrentDownloads) {
+        PartsProcessor.activePartJobs += 1;
+        try {
+          const permit = await this.acquireGlobalPermit(job);
+          // this.logger.debug(
+          //   `Part queue job ${job.id}: acquired part slot (${PartsProcessor.activePartJobs}/${parallelMaxConcurrentDownloads})`,
+          // );
+          return permit;
+        } catch (e) {
+          PartsProcessor.activePartJobs = Math.max(0, PartsProcessor.activePartJobs - 1);
+          const next = PartsProcessor.partWaiters.shift();
+          if (next) next();
+          throw e;
+        }
       }
-    }
-    this.logger.debug(`Part queue job ${job.id}: waiting part slot (${PartsProcessor.activePartJobs}/${this.parallelMaxConcurrentDownloads})`);
-    await new Promise<void>((resolve) => PartsProcessor.partWaiters.push(resolve));
-    PartsProcessor.activePartJobs += 1;
-    try {
-      const permit = await this.acquireGlobalPermit(job);
-      this.logger.debug(
-        `Part queue job ${job.id}: acquired part slot after wait (${PartsProcessor.activePartJobs}/${this.parallelMaxConcurrentDownloads})`,
-      );
-      return permit;
-    } catch (e) {
-      PartsProcessor.activePartJobs = Math.max(0, PartsProcessor.activePartJobs - 1);
-      const next = PartsProcessor.partWaiters.shift();
-      if (next) next();
-      throw e;
+      // this.logger.debug(`Part queue job ${job.id}: waiting part slot (${PartsProcessor.activePartJobs}/${parallelMaxConcurrentDownloads})`);
+      await new Promise<void>((resolve) => setTimeout(resolve, 250));
     }
   }
 
@@ -481,14 +469,15 @@ export class PartsProcessor {
   }
 
   private async acquireGlobalPermit(job: Job<PartJobData>): Promise<string | null> {
-    if (this.globalParallelMaxConcurrentDownloads <= 0) return null;
     const redisClient: any = (this.partsQueue && (this.partsQueue as any).client) ? (this.partsQueue as any).client : null;
-    if (!redisClient || typeof redisClient.eval !== 'function') {
-      throw new Error(`global limiter enabled but redis eval is unavailable for part job ${job.id}`);
-    }
 
     const token = `${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2)}-${job.id}`;
     while (true) {
+      const limiter = this.getCurrentParallelLimiterConfig();
+      if (limiter.maxConcurrent <= 0) return null;
+      if (!redisClient || typeof redisClient.eval !== 'function') {
+        throw new Error(`global limiter enabled but redis eval is unavailable for part job ${job.id}`);
+      }
       const now = Date.now();
       let ok = 0;
       try {
@@ -497,8 +486,8 @@ export class PartsProcessor {
           1,
           GLOBAL_PARTS_SEMAPHORE_KEY,
           String(now),
-          String(this.globalLimiterLeaseMs),
-          String(this.globalParallelMaxConcurrentDownloads),
+          String(limiter.leaseMs),
+          String(limiter.maxConcurrent),
           token,
         )) || 0;
       } catch (e) {
@@ -509,20 +498,22 @@ export class PartsProcessor {
         this.startPermitRenew(token, redisClient);
         return token;
       }
-      await new Promise((r) => setTimeout(r, this.globalLimiterWaitMs));
+      await new Promise((r) => setTimeout(r, limiter.waitMs));
     }
   }
 
   private startPermitRenew(token: string, redisClient: any): void {
-    const period = Math.max(1000, Math.floor(this.globalLimiterLeaseMs / 3));
+    const base = this.getCurrentParallelLimiterConfig();
+    const period = Math.max(1000, Math.floor(base.leaseMs / 3));
     const t = setInterval(async () => {
       try {
+        const limiter = this.getCurrentParallelLimiterConfig();
         await redisClient.eval(
           RENEW_GLOBAL_PERMIT_LUA,
           1,
           GLOBAL_PARTS_SEMAPHORE_KEY,
           String(Date.now()),
-          String(this.globalLimiterLeaseMs),
+          String(limiter.leaseMs),
           token,
         );
       } catch (e) {
@@ -551,5 +542,17 @@ export class PartsProcessor {
     } catch (e) {
       // ignore release errors
     }
+  }
+
+  private getCurrentPartConcurrency(): number {
+    return Math.max(1, Number(this.runtimeConfig.getGlobal('download.parallelMaxConcurrentDownloads') ?? process.env.PARALLEL_MAX_CONCURRENT_DOWNLOADS ?? 10));
+  }
+
+  private getCurrentParallelLimiterConfig(): { maxConcurrent: number; leaseMs: number; waitMs: number } {
+    return {
+      maxConcurrent: Math.max(0, Number(this.runtimeConfig.getGlobal('download.globalParallelMaxConcurrentDownloads') ?? process.env.GLOBAL_PARALLEL_MAX_CONCURRENT_DOWNLOADS ?? 10)),
+      leaseMs: Math.max(5000, Number(this.runtimeConfig.getGlobal('download.globalLimiterLeaseMs') ?? process.env.GLOBAL_LIMITER_LEASE_MS ?? 120000)),
+      waitMs: Math.max(100, Number(this.runtimeConfig.getGlobal('download.globalLimiterWaitMs') ?? process.env.GLOBAL_LIMITER_WAIT_MS ?? 300)),
+    };
   }
 }

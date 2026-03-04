@@ -1,15 +1,20 @@
 import { Injectable, HttpException, HttpStatus } from '@nestjs/common';
 import { InjectQueue } from '@nestjs/bull';
 import { Queue } from 'bull';
-import { ConfigService } from '@nestjs/config';
+import { RuntimeConfigService } from '../config/runtime-config.service';
+import { ConcretePlatform } from '../source/source.types';
 
 @Injectable()
 export class DownloadService {
-  constructor(@InjectQueue('downloads') private readonly downloadQueue: Queue, private readonly config: ConfigService) {}
+  constructor(@InjectQueue('downloads') private readonly downloadQueue: Queue, private readonly runtimeConfig: RuntimeConfigService) {}
 
   async enqueue(payload: any) {
-    const retryCount = Number(this.config.get('download.retryCount') ?? 3);
-    const retryBackoffMs = Number(this.config.get('download.retryBackoffMs') ?? 5000);
+    const rawPlatform = String(payload?.platform || 'generic').toLowerCase();
+    const platform: ConcretePlatform = rawPlatform === 'bilibili' || rawPlatform === 'youtube' || rawPlatform === 'generic'
+      ? (rawPlatform as ConcretePlatform)
+      : 'generic';
+    const retryCount = Number(this.runtimeConfig.getForSource(platform, 'download.retryCount') ?? 3);
+    const retryBackoffMs = Number(this.runtimeConfig.getForSource(platform, 'download.retryBackoffMs') ?? 5000);
     try {
       const job = await this.downloadQueue.add(payload, { attempts: retryCount, backoff: retryBackoffMs });
       return job;

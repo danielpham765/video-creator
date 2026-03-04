@@ -37,4 +37,26 @@ export class FfmpegService {
         .save(outputPath);
     });
   }
+
+  async stripAudio(inputPath: string, outputPath: string): Promise<void> {
+    return new Promise((resolve, reject) => {
+      ffmpeg()
+        .input(inputPath)
+        .outputOptions(['-c:v copy', '-an'])
+        .on('end', () => resolve())
+        .on('error', (err: any) => reject(err))
+        .save(outputPath);
+    });
+  }
+
+  async extractAudioToM4a(inputPath: string, outputPath: string): Promise<void> {
+    return new Promise((resolve, reject) => {
+      ffmpeg()
+        .input(inputPath)
+        .outputOptions(['-vn', '-c:a aac', '-b:a 192k'])
+        .on('end', () => resolve())
+        .on('error', (err: any) => reject(err))
+        .save(outputPath);
+    });
+  }
 }

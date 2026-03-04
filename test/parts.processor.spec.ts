@@ -9,6 +9,16 @@ jest.mock('axios');
 describe('PartsProcessor', () => {
   const dataDir = path.join(process.cwd(), 'data');
   const jobId = 'testjob';
+  const makeRuntimeConfig = () => ({
+    getGlobal: jest.fn((key: string) => {
+      if (key === 'download.globalParallelMaxConcurrentDownloads') return 0;
+      if (key === 'download.parallelMaxConcurrentDownloads') return 10;
+      if (key === 'download.resumeEnabled') return true;
+      if (key === 'download.timeoutMs') return 30000;
+      if (key === 'proxy.http' || key === 'proxy.https') return '';
+      return undefined;
+    }),
+  });
   beforeAll(() => { if (!fs.existsSync(dataDir)) fs.mkdirSync(dataDir, { recursive: true }); });
   afterAll(() => { try { fs.rmSync(path.join(dataDir, jobId), { recursive: true }); } catch (e) {} });
 
@@ -24,17 +34,18 @@ describe('PartsProcessor', () => {
     });
 
     const fakeQueue: any = { client: { hset: jest.fn().mockResolvedValue(1) } };
-    const processor = new PartsProcessor(fakeQueue);
+    const fakeRuntimeConfig: any = makeRuntimeConfig();
+    const processor = new PartsProcessor(fakeQueue, fakeRuntimeConfig);
 
     const job: any = {
       data: {
         jobId,
-        bvid: 'bv1',
+        vid: 'bv1',
         url: 'http://example.com/file',
         partIndex: 0,
         rangeStart: 0,
-        rangeEnd: 100,
-        expectedBytes: 100,
+        rangeEnd: content.length - 1,
+        expectedBytes: content.length,
         headers: {},
       },
       progress: jest.fn().mockResolvedValue(undefined),
@@ -58,11 +69,12 @@ describe('PartsProcessor', () => {
       .mockImplementationOnce(() => Promise.resolve({ data: stream2, headers: { 'content-length': String(seg2.length) }, status: 200 }));
 
     const fakeQueue: any = { client: { hset: jest.fn().mockResolvedValue(1) } };
-    const processor = new PartsProcessor(fakeQueue);
+    const fakeRuntimeConfig: any = makeRuntimeConfig();
+    const processor = new PartsProcessor(fakeQueue, fakeRuntimeConfig);
     const job: any = {
       data: {
         jobId,
-        bvid: 'bv1',
+        vid: 'bv1',
         segmentUrls: ['http://example.com/seg1', 'http://example.com/seg2'],
         partIndex: 1,
         expectedBytes: seg1.length + seg2.length,

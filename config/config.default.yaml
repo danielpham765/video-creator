@@ -27,7 +27,7 @@ download:
   # Where download artifacts and manifests are stored (ENV: DATA_DIR)
   dataDir: /usr/src/app/data
   # Where final output videos are stored (ENV: RESULT_DIR)
-  resultDir: /usr/src/app/result
+  resultDir: /usr/src/app/video-result
   # Size per part when splitting (in megabytes). Default: 8 (ENV: PART_SIZE_BYTES)
   # Note: application should interpret this value as MB and convert to bytes.
   partSizeBytes: 16

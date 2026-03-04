@@ -1,33 +1,31 @@
-import { ApiProperty } from '@nestjs/swagger';
-import { IsInt, IsNotEmpty, IsOptional, IsString, IsUrl, Min } from 'class-validator';
+import { ApiProperty, ApiPropertyOptional } from '@nestjs/swagger';
+import { IsIn, IsInt, IsNotEmpty, IsOptional, IsString, IsUrl, Min } from 'class-validator';
+import { createDownloadDtoSwagger } from './create-download.swagger';
 
 export class CreateDownloadDto {
-  @ApiProperty({
-    description: 'Public video URL to download (Bilibili link or similar)',
-    example: 'https://www.bilibili.com/video/BV1xx411c7mD',
-    required: true,
-  })
+  @ApiProperty(createDownloadDtoSwagger.url)
   @IsUrl()
   @IsNotEmpty()
   url: string;
 
-  @ApiProperty({
-    description: 'Optional title to save the video under',
-    required: false,
-    example: 'My favorite clip',
-  })
+  @ApiPropertyOptional(createDownloadDtoSwagger.title)
   @IsOptional()
   @IsString()
   title?: string;
 
-  @ApiProperty({
-    description: 'Optional page/part number for multi-part Bilibili videos (1-based)',
-    required: false,
-    example: 2,
-    minimum: 1,
-  })
+  @ApiPropertyOptional(createDownloadDtoSwagger.p)
   @IsOptional()
   @IsInt()
   @Min(1)
   p?: number;
+
+  @ApiPropertyOptional(createDownloadDtoSwagger.platform)
+  @IsOptional()
+  @IsIn(['auto', 'bilibili', 'youtube', 'generic'])
+  platform?: 'auto' | 'bilibili' | 'youtube' | 'generic';
+
+  @ApiPropertyOptional(createDownloadDtoSwagger.media)
+  @IsOptional()
+  @IsIn(['both', 'video', 'audio'])
+  media?: 'both' | 'video' | 'audio';
 }

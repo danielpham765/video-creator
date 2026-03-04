@@ -7,6 +7,7 @@ import { FfmpegModule } from '../ffmpeg/ffmpeg.module';
 import { JobsModule } from '../jobs/jobs.module';
 import { AppConfigModule } from '../config/config.module';
 import { ConfigService } from '@nestjs/config';
+import { SourceModule } from '../source/source.module';
 
 @Module({
   imports: [
@@ -20,6 +21,7 @@ import { ConfigService } from '@nestjs/config';
       inject: [ConfigService],
     }),
     PlayurlModule,
+    SourceModule,
     FfmpegModule,
     BullModule.registerQueue({ name: 'downloads' }, { name: 'download-parts' }),
     JobsModule,

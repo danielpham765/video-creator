@@ -4,7 +4,7 @@ Last updated: 2026-02-28
 
 ### High-level overview
 
-- Purpose: background-friendly Bilibili downloader. API receives download requests, worker resolves playable URLs, downloads, merges, and stores final files in `data/`.
+- Purpose: background-friendly multi-source downloader. API receives download requests, worker resolves playable URLs via platform handlers, downloads, merges/transcodes, and stores final files in `result/`.
 - Stack: NestJS + Bull + Redis + FFmpeg.
 - Persistence: Bull/Redis for queue state, filesystem for artifacts/history (`data/`, `logs/`).
 
@@ -32,8 +32,10 @@ Last updated: 2026-02-28
 - `DownloadModule`:
   - wires `DownloadController` and `DownloadService`.
   - registers queue `downloads`.
-- `PlayurlService`:
-  - resolves `cid` and `playurl` from Bilibili APIs.
+- `SourceModule`:
+  - resolves source URL/page into normalized streams via Bilibili/YouTube/Generic handlers.
+- `MediaPlannerService`:
+  - maps requested `media` (`both|video|audio`) to effective mode with fallback reason when needed.
 - `WorkerProcessor`:
   - handles master `downloads` jobs (strategy select, merge, history).
 - `PartsProcessor`:
@@ -46,8 +48,8 @@ Last updated: 2026-02-28
 ### API routes
 
 - `POST /download`
-  - Body DTO: `CreateDownloadDto` (`url` required, `title` optional).
-  - Controller extracts `bvid` from URL (or uses provided `bvid` internally), enqueues job payload `{ bvid, url, title }`.
+  - Body DTO: `CreateDownloadDto` (`url` required, `title?`, `platform?`, `media?`).
+  - Controller enqueues payload with normalized `{ platform, vid, mediaRequested, url, title }`.
 - `GET /download/status/:id`
   - Returns job `state`, `progress`, `failedReason`, `result`, `history`.
   - Adds parts summary from Redis hash `job:parts:<id>`.
@@ -60,7 +62,7 @@ Last updated: 2026-02-28
 
 ### Source and auth inputs
 
-- Cookies are loaded by worker from `config/cookies.json`.
+- Cookies are loaded by worker from `config/cookies/<source>.json`.
 - Request body does not carry cookies.
 - Supported cookie formats in file:
   - browser export array (`[{name,value}, ...]`)
@@ -86,7 +88,7 @@ Last updated: 2026-02-28
   - Vietnamese/Latin: remove accents, lowercase, spaces -> `-`, trim duplicates.
   - Chinese/CJK: keep original (sanitized for path-invalid chars).
 - Final path:
-  - `result/bilibili/<normalizedTitle>/<bvid>-<jobId>.mp4`
+  - `result/<platform>/<normalizedTitle>/<vid>-<jobId>.<ext>`
 
 ### Strategy selection (current order)
 
@@ -247,7 +249,7 @@ Logger: `FileLoggerService` (used as Nest logger in `main.ts`).
   - local: max files and optional retention days.
   - S3: retention days cleanup.
 
-### Key config fields (`config/config.yaml`)
+### Key config fields (`config/config.default.yaml` + `config/config.<source>.yaml`)
 
 - `worker.concurrency`
 - `download.partSizeBytes` (interpreted as MB)
