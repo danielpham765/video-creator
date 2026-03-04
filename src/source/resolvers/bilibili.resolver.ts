@@ -1,7 +1,7 @@
-import { Injectable } from '@nestjs/common';
+import { Inject, Injectable } from '@nestjs/common';
 import axios from 'axios';
-import { PlayurlService } from '../../playurl/playurl.service';
-import { ResolveSourceInput, ResolvedSource, SourceResolver } from '../source.types';
+import { BILIBILI_PLAYURL_PROVIDER } from '../source.tokens';
+import { ResolveSourceInput, ResolvedSource, SourcePlayurlProvider, SourceResolver } from '../source.types';
 import { RuntimeConfigService } from '../../config/runtime-config.service';
 import { buildVideoQualityPolicy } from '../video-quality';
 
@@ -10,7 +10,8 @@ export class BilibiliResolver implements SourceResolver {
   readonly platform = 'bilibili' as const;
 
   constructor(
-    private readonly playurl: PlayurlService,
+    @Inject(BILIBILI_PLAYURL_PROVIDER)
+    private readonly playurlProvider: SourcePlayurlProvider,
     private readonly runtimeConfig: RuntimeConfigService,
   ) {}
 
@@ -27,10 +28,8 @@ export class BilibiliResolver implements SourceResolver {
 
     const page = Number.isFinite(Number(input.page)) && Number(input.page) >= 1 ? Math.floor(Number(input.page)) : 1;
     const cookies = input.cookies;
-    const cid = await this.playurl.getCidFromBvid(vid, page);
-    if (!cid) throw new Error('cannot resolve bilibili cid');
-
-    const play = await this.playurl.getPlayurl(vid, cid, cookies);
+    const resolved = await this.playurlProvider.resolvePlayurl({ vid, page, cookies });
+    const play = resolved.play;
     const dash = this.selectDashTracks(play?.data?.dash);
     const durl = String(play?.data?.durl?.[0]?.url || '').trim();
     const headers: Record<string, string> = { Referer: `https://www.bilibili.com/video/${vid}` };

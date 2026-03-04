@@ -1,16 +1,10 @@
-import { Injectable } from '@nestjs/common';
-import { BilibiliResolver } from './resolvers/bilibili.resolver';
-import { GenericResolver } from './resolvers/generic.resolver';
-import { YouTubeResolver } from './resolvers/youtube.resolver';
-import { ConcretePlatform, Platform, ResolveSourceInput, ResolvedInputIdentity, ResolvedSource } from './source.types';
+import { Inject, Injectable } from '@nestjs/common';
+import { SOURCE_RESOLVERS } from './source.tokens';
+import { ConcretePlatform, Platform, ResolveSourceInput, ResolvedInputIdentity, ResolvedSource, SourceResolver } from './source.types';
 
 @Injectable()
 export class SourceRegistryService {
-  constructor(
-    private readonly bilibiliResolver: BilibiliResolver,
-    private readonly youtubeResolver: YouTubeResolver,
-    private readonly genericResolver: GenericResolver,
-  ) {}
+  constructor(@Inject(SOURCE_RESOLVERS) private readonly resolvers: SourceResolver[]) {}
 
   identifyInput(url: string, forcedPlatform: Platform = 'auto'): ResolvedInputIdentity {
     const platform = this.selectPlatform(url, forcedPlatform);
@@ -32,16 +26,20 @@ export class SourceRegistryService {
 
   async resolve(input: ResolveSourceInput): Promise<ResolvedSource> {
     const platform = this.selectPlatform(input.url, input.platform || 'auto');
-    if (platform === 'bilibili') return this.bilibiliResolver.resolve({ ...input, platform: 'bilibili' });
-    if (platform === 'youtube') return this.youtubeResolver.resolve({ ...input, platform: 'youtube' });
-    return this.genericResolver.resolve({ ...input, platform: 'generic' });
+    const resolver = this.getResolverByPlatform(platform);
+    return resolver.resolve({ ...input, platform });
   }
 
   private selectPlatform(url: string, forced: Platform): ConcretePlatform {
     if (forced && forced !== 'auto') return forced;
-    if (this.bilibiliResolver.canResolve(url)) return 'bilibili';
-    if (this.youtubeResolver.canResolve(url)) return 'youtube';
-    return 'generic';
+    const matched = this.resolvers.find((resolver) => resolver.platform !== 'generic' && resolver.canResolve(url));
+    return matched?.platform || 'generic';
+  }
+
+  private getResolverByPlatform(platform: ConcretePlatform): SourceResolver {
+    const resolver = this.resolvers.find((item) => item.platform === platform);
+    if (resolver) return resolver;
+    throw new Error(`resolver not configured for platform=${platform}`);
   }
 
   private genericId(url: string): string {

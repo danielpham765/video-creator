@@ -28,4 +28,9 @@ export class CreateDownloadDto {
   @IsOptional()
   @IsIn(['both', 'video', 'audio'])
   media?: 'both' | 'video' | 'audio';
+
+  @ApiPropertyOptional(createDownloadDtoSwagger.engine)
+  @IsOptional()
+  @IsIn(['auto', 'yt-dlp', 'native'])
+  engine?: 'auto' | 'yt-dlp' | 'native';
 }

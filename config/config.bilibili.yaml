@@ -1,2 +1,3 @@
 download:
   partSizeBytes: 16
+  engine: native

@@ -47,9 +47,20 @@ export class DownloadController {
     const platform = (payload.platform || 'auto') as Platform;
     const mediaRequested = (payload.media || 'both') as MediaMode;
     const identity = this.sourceRegistry.identifyInput(url, platform);
+    const configuredEngineRaw = String(this.runtimeConfig.getForSource(identity.platform, 'download.engine') || 'auto').toLowerCase();
+    const configuredEngine: 'auto' | 'yt-dlp' | 'native' =
+      configuredEngineRaw === 'yt-dlp' || configuredEngineRaw === 'native'
+        ? (configuredEngineRaw as 'yt-dlp' | 'native')
+        : 'auto';
+    const payloadEngineRaw = String((payload as any).engine || '').toLowerCase();
+    const engine: 'auto' | 'yt-dlp' | 'native' =
+      payloadEngineRaw === 'yt-dlp' || payloadEngineRaw === 'native' || payloadEngineRaw === 'auto'
+        ? (payloadEngineRaw as 'auto' | 'yt-dlp' | 'native')
+        : configuredEngine;
     const jobPayload: any = {
       platform: identity.platform,
       mediaRequested,
+      engine,
       vid: identity.vid,
       url,
       title: payload.title,
@@ -134,17 +145,27 @@ export class DownloadController {
   async resume(@Param('id') id: string) {
     let job = await this.downloadQueue.getJob(id as any);
     let data: any = job?.data || null;
+    let archived: any = null;
     if (!data) {
       try {
-        const archived = await this.archiveRepo.getByJobId(id);
-        data = archived?.masterStatus?.data || null;
+        archived = await this.archiveRepo.getByJobId(id);
+        data = archived?.masterStatus?.data || archived?.masterRaw?.data || null;
       } catch (e) {
         data = null;
       }
     }
     if (!data) throw new NotFoundException('job not found');
-    const vid = data.vid;
-    if (!vid) throw new NotFoundException('vid missing from job data');
+    const normalizedData: any = { ...data };
+    const resumeUrl = String(normalizedData.url || '').trim();
+    if (!resumeUrl) {
+      throw new BadRequestException('cannot resume this archived job: original url is missing; start a new /download job with url');
+    }
+    const platformFromUrl = this.sourceRegistry.identifyInput(resumeUrl, (normalizedData.platform || 'auto') as Platform);
+    normalizedData.platform = platformFromUrl.platform;
+    normalizedData.vid = normalizedData.vid || platformFromUrl.vid;
+    normalizedData.mediaRequested = normalizedData.mediaRequested || 'both';
+    const vid = normalizedData.vid;
+    if (!vid) throw new BadRequestException('cannot resume this job: vid missing from url');
 
     const stopKey = `job:stop:${id}`;
     const cancelKey = `job:cancel:${id}`;
@@ -218,21 +239,21 @@ export class DownloadController {
     let newJob: any = null;
       try {
         await this.history.appendEvent(id, { state: 'requeueing', progress: 0 });
-        const rawPlatform = String((data as any)?.platform || 'generic').toLowerCase();
+        const rawPlatform = String((normalizedData as any)?.platform || 'generic').toLowerCase();
         const platform: ConcretePlatform = rawPlatform === 'bilibili' || rawPlatform === 'youtube' || rawPlatform === 'generic'
           ? (rawPlatform as ConcretePlatform)
           : 'generic';
         const retryCount = Number(this.runtimeConfig.getForSource(platform, 'download.retryCount') ?? 3);
         const retryBackoffMs = Number(this.runtimeConfig.getForSource(platform, 'download.retryBackoffMs') ?? 5000);
         const prevIds: string[] = [];
-        if ((data as any)?.resumeFromJobId) prevIds.push(String((data as any).resumeFromJobId));
-        if (Array.isArray((data as any)?.resumeFromJobIds)) {
-          for (const v of (data as any).resumeFromJobIds) {
+        if ((normalizedData as any)?.resumeFromJobId) prevIds.push(String((normalizedData as any).resumeFromJobId));
+        if (Array.isArray((normalizedData as any)?.resumeFromJobIds)) {
+          for (const v of (normalizedData as any).resumeFromJobIds) {
             if (v !== undefined && v !== null && String(v).trim()) prevIds.push(String(v));
           }
         }
         const resumeFromJobIds = Array.from(new Set([String(id), ...prevIds]));
-        const resumePayload = { ...data, resumeFromJobId: String(id), resumeFromJobIds };
+        const resumePayload = { ...normalizedData, resumeFromJobId: String(id), resumeFromJobIds };
         newJob = await this.downloadQueue.add(resumePayload, { attempts: retryCount, backoff: retryBackoffMs });
         await this.history.appendEvent(id, { state: 'resume-requested', progress: 1 });
       } catch (e) {

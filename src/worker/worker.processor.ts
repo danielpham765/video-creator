@@ -6,12 +6,14 @@ import { JobHistoryService } from '../jobs/job-history.service';
 import { JobArchiveService } from '../jobs/job-archive.service';
 import * as fs from 'fs';
 import * as path from 'path';
+import { spawn } from 'child_process';
+import { createInterface } from 'readline';
 import resumeDownload, { ResumeDownloadResult } from '../utils/resume-download';
 import { formatMb, formatMbProgress } from '../utils/size-format';
 import { formatElapsedDuration } from '../utils/duration-format';
 import axios from 'axios';
 import { MediaPlannerService } from '../source/media-planner.service';
-import { MediaMode, Platform, ResolvedSource } from '../source/source.types';
+import { ConcretePlatform, MediaMode, Platform, ResolvedSource } from '../source/source.types';
 import { SourceRegistryService } from '../source/source-registry.service';
 import { buildVideoQualityPolicy } from '../source/video-quality';
 import { RuntimeConfigService } from '../config/runtime-config.service';
@@ -97,6 +99,21 @@ return 1
   async handleJob(job: Job) {
     const jobStartedAt = Date.now();
     let payload: any = {};
+    let requestedEngine: 'auto' | 'yt-dlp' | 'native' = 'auto';
+    let downloadEngine: 'yt-dlp' | 'native' = 'native';
+    let downloadMode = 'native-unknown';
+    let ytDlpFallbackContext: {
+      requestUrl: string;
+      platform: ConcretePlatform;
+      vid: string;
+      title: string;
+      safeTitle: string;
+      mediaEffective: MediaMode;
+      cookies: string;
+      mediaRequested: MediaMode;
+      mediaFallbackReason: string | null;
+    } | null = null;
+    let nativeAttempted = false;
     const manifestDir = path.join(this['dataDir'], String(job.id));
     const manifestPath = path.join(manifestDir, 'manifest.json');
     await this.acquireMasterSlot(job);
@@ -107,8 +124,32 @@ return 1
       const requestedPlatform = (payload.platform || 'auto') as Platform;
       const mediaRequested = (payload.mediaRequested || 'both') as MediaMode;
       const requestUrl = String(payload.url || '').trim();
-      if (!requestUrl) throw new Error('missing url');
+      if (!requestUrl) {
+        try { job.discard(); } catch {}
+        throw new Error('missing url');
+      }
       const concretePlatform = this.sourceRegistry.identifyInput(requestUrl, requestedPlatform).platform;
+      const configuredEngineRaw = String(this.runtimeConfig.getForSource(concretePlatform, 'download.engine') || 'auto').toLowerCase();
+      const configuredEngine: 'auto' | 'yt-dlp' | 'native' =
+        configuredEngineRaw === 'yt-dlp' || configuredEngineRaw === 'native'
+          ? (configuredEngineRaw as 'yt-dlp' | 'native')
+          : 'auto';
+      const requestedEngineRaw = String(payload.engine || '').toLowerCase();
+      const payloadEngineValid =
+        requestedEngineRaw === 'yt-dlp' || requestedEngineRaw === 'native' || requestedEngineRaw === 'auto';
+      const requestedEngineSource: 'payload' | 'config' = payloadEngineValid ? 'payload' : 'config';
+      requestedEngine = payloadEngineValid
+        ? (requestedEngineRaw as 'auto' | 'yt-dlp' | 'native')
+        : configuredEngine;
+      if (requestedEngineRaw && !payloadEngineValid) {
+        this.logger.warn(
+          `Job ${job.id}: payload.engine="${requestedEngineRaw}" is invalid; fallback to configured engine "${configuredEngine}"`,
+        );
+      }
+      this.logger.debug(
+        `Job ${job.id}: engine strategy resolved requested=${requestedEngine} source=${requestedEngineSource} ` +
+          `(payload.engine="${requestedEngineRaw || '<empty>'}", configured="${configuredEngineRaw}"=>${configuredEngine})`,
+      );
       const page = Number.isFinite(Number(payload.page)) && Number(payload.page) >= 1
         ? Math.floor(Number(payload.page))
         : 1;
@@ -147,6 +188,27 @@ return 1
         });
       }
       await this.history.appendEvent(job.id.toString(), { state: 'media-effective', progress: 10, effective: mediaPlan.effective });
+      await this.history.appendEvent(job.id.toString(), { state: 'engine-requested', progress: 10, engine: requestedEngine });
+      const markDownloadMode = async (engine: 'yt-dlp' | 'native', mode: string, reason?: string): Promise<void> => {
+        if (downloadEngine === engine && downloadMode === mode) return;
+        const prevEngine = downloadEngine;
+        const prevMode = downloadMode;
+        downloadEngine = engine;
+        downloadMode = mode;
+        this.logger.debug(
+          `Job ${job.id}: download mode transition ${prevEngine}/${prevMode} -> ${downloadEngine}/${downloadMode}` +
+            `${reason ? ` reason="${reason}"` : ''}`,
+        );
+        await this.history.appendEvent(job.id.toString(), {
+          state: 'download-mode',
+          progress: Number(await job.progress()) || 0,
+          downloadEngine,
+          downloadMode,
+          fromEngine: prevEngine,
+          fromMode: prevMode,
+          reason: reason || null,
+        });
+      };
 
       const commonHeaders: Record<string, string> = { ...(resolvedSource.headers || {}) };
       if (cookies && !commonHeaders.Cookie) commonHeaders.Cookie = cookies;
@@ -157,10 +219,17 @@ return 1
       );
       const resolvedQn = Number(resolvedSource?.qualityMeta?.qn ?? play?.data?.quality ?? 0);
       if (resolvedQn > 0 && resolvedQn < qualityPolicy.minAcceptableQn) {
-        throw new Error(
-          `resolved quality qn=${resolvedQn} is below accepted minimum ` +
-            `${qualityPolicy.minAcceptableQn} for prefer=${qualityPolicy.preferredLabel}`,
-        );
+        if (platform === 'youtube') {
+          this.logger.warn(
+            `Job ${job.id}: youtube resolved quality qn=${resolvedQn} is below configured minimum ` +
+              `${qualityPolicy.minAcceptableQn}; continuing with best available stream`,
+          );
+        } else {
+          throw new Error(
+            `resolved quality qn=${resolvedQn} is below accepted minimum ` +
+              `${qualityPolicy.minAcceptableQn} for prefer=${qualityPolicy.preferredLabel}`,
+          );
+        }
       }
       this.logger.debug(
         `Job ${job.id}: resolved playurl quality qn=${resolvedQn} (prefer=${qualityPolicy.preferredLabel}, ` +
@@ -192,6 +261,17 @@ return 1
       }
       const safeTitle = this.normalizeTitleForFolder(title);
       this.logger.debug(`Job ${job.id}: normalized folder title="${safeTitle}" from title="${title}"`);
+      ytDlpFallbackContext = {
+        requestUrl,
+        platform,
+        vid,
+        title,
+        safeTitle,
+        mediaEffective: mediaPlan.effective,
+        cookies,
+        mediaRequested,
+        mediaFallbackReason: mediaPlan.fallbackReason || null,
+      };
       if (!fs.existsSync(manifestDir)) fs.mkdirSync(manifestDir, { recursive: true });
 
       // Compute part size (configured as MB in config.download.partSizeBytes)
@@ -245,7 +325,101 @@ return 1
         } catch (e) { }
       }
 
+      if (requestedEngine === 'yt-dlp') {
+        await markDownloadMode('yt-dlp', 'yt-dlp-direct', 'engine explicitly resolved to yt-dlp');
+        const ytDlpResult = await this.tryDirectDownloadViaYtDlp({
+          job,
+          requestUrl,
+          platform,
+          vid,
+          title,
+          safeTitle,
+          mediaEffective: mediaPlan.effective,
+          cookies,
+          manifestDir,
+          stopRequested: () => stopRequested,
+          cancelRequested: () => cancelRequested,
+        });
+        if (ytDlpResult?.stopped) {
+          await this.history.appendEvent(job.id.toString(), { state: 'stopped', progress: 0 });
+          this.logger.log(`Job ${job.id} stopped during yt-dlp download`);
+          try { if (redisClient) await redisClient.del(stopKey); } catch (e) {}
+          if (_poll) clearInterval(_poll);
+          try {
+            if (subClient) {
+              if (typeof subClient.unsubscribe === 'function') {
+                try { await subClient.unsubscribe(stopKey); } catch {}
+                try { await subClient.unsubscribe(cancelKey); } catch {}
+              }
+              if (typeof subClient.disconnect === 'function') await subClient.disconnect();
+              if (typeof subClient.quit === 'function') await subClient.quit();
+            }
+          } catch (e) {}
+          return { stopped: true };
+        }
+        if (ytDlpResult?.cancelled) {
+          await this.history.appendEvent(job.id.toString(), { state: 'cancelled', progress: 0 });
+          this.logger.log(`Job ${job.id} cancelled during yt-dlp download`);
+          if (_poll) clearInterval(_poll);
+          try {
+            if (subClient) {
+              if (typeof subClient.unsubscribe === 'function') {
+                try { await subClient.unsubscribe(stopKey); } catch {}
+                try { await subClient.unsubscribe(cancelKey); } catch {}
+              }
+              if (typeof subClient.disconnect === 'function') await subClient.disconnect();
+              if (typeof subClient.quit === 'function') await subClient.quit();
+            }
+          } catch (e) {}
+          return { cancelled: true };
+        }
+        if (ytDlpResult?.path) {
+          await job.progress(100);
+          await this.history.appendEvent(job.id.toString(), {
+            state: 'finished',
+            progress: 100,
+            result: {
+              path: ytDlpResult.path,
+              platform,
+              vid,
+              title,
+              mediaRequested,
+              mediaEffective: mediaPlan.effective,
+              mediaFallbackReason: mediaPlan.fallbackReason || null,
+              downloadEngine,
+              downloadMode,
+            },
+          });
+          this.cleanupJobTempArtifacts(String(job.id), ytDlpResult.path);
+          this.logger.log(`Job ${job.id} finished in ${formatElapsedDuration(Date.now() - jobStartedAt)}, output: ${ytDlpResult.path} (engine=yt-dlp)`);
+          return {
+            path: ytDlpResult.path,
+            platform,
+            vid,
+            title,
+            mediaRequested,
+            mediaEffective: mediaPlan.effective,
+            mediaFallbackReason: mediaPlan.fallbackReason || null,
+            downloadEngine,
+            downloadMode,
+          };
+        }
+        if (requestedEngine === 'yt-dlp') {
+          throw new Error('yt-dlp engine requested but direct download failed');
+        }
+      } else {
+        nativeAttempted = true;
+        await markDownloadMode(
+          'native',
+          requestedEngine === 'native' ? 'native-forced' : 'native-primary',
+          requestedEngine === 'native'
+            ? 'engine explicitly resolved to native'
+            : 'engine=auto prefers native before yt-dlp fallback',
+        );
+      }
+
       if (play.data?.dash) {
+        await markDownloadMode('native', 'dash-single', 'DASH stream detected; start with dash-single baseline');
         const selectedDash = this.selectDashTracks(play.data.dash, qualityPolicy.preferredQn, qualityPolicy.minAcceptableQn);
         const videoUrl = selectedDash.videoUrl;
         const audioUrl = selectedDash.audioUrl;
@@ -338,6 +512,7 @@ return 1
 
         // If we found segment lists, create parts and enqueue part jobs for both video and audio (when available)
         if (Array.isArray(segmentList) && segmentList.length > 0 && this.partsQueue) {
+          await markDownloadMode('native', 'dash-segmented', 'manifest segments detected (HLS/MPD); prefer segmented strategy');
           const partsDir = path.join(manifestDir, 'parts'); if (!fs.existsSync(manifestDir)) fs.mkdirSync(manifestDir, { recursive: true }); if (!fs.existsSync(partsDir)) fs.mkdirSync(partsDir, { recursive: true });
 
           const segments: Array<{ url: string; approxBytes: number }> = [];
@@ -569,6 +744,7 @@ return 1
           const useVideoParallel = videoProbe.useParallel && videoProbe.totalSize > 0;
           const useAudioParallel = audioProbe.useParallel && audioProbe.totalSize > 0;
           if (useVideoParallel && audioProbe.totalSize > 0) {
+            await markDownloadMode('native', 'dash-byte-range', 'segmented not used; DASH supports byte-range parallelization');
             const partsDir = path.join(manifestDir, 'parts');
             if (!fs.existsSync(manifestDir)) fs.mkdirSync(manifestDir, { recursive: true });
             if (!fs.existsSync(partsDir)) fs.mkdirSync(partsDir, { recursive: true });
@@ -756,10 +932,11 @@ return 1
             try { if (audioConcatTmp !== audioTmp) fs.unlinkSync(audioConcatTmp); } catch (e) {}
             didSegment = true;
           } else {
+            const nextStrategy = play.data?.durl?.length ? 'durl-byte-range' : 'dash-single';
             this.logger.debug(
               `Job ${job.id}: dash-byte-range not applicable; continue strategy fallback ` +
               `(video: useParallel=${videoProbe.useParallel}, size=${videoProbe.totalSize}; ` +
-              `audio: useParallel=${audioProbe.useParallel}, size=${audioProbe.totalSize}; partSizeBytes=${partSizeBytes})`,
+              `audio: useParallel=${audioProbe.useParallel}, size=${audioProbe.totalSize}; partSizeBytes=${partSizeBytes}; next=${nextStrategy})`,
             );
           }
         }
@@ -768,7 +945,7 @@ return 1
         if (!didSegment && play.data?.durl?.length) {
           const durlUrl = play.data.durl[0]?.url;
           if (durlUrl) {
-            this.logger.log(`Job ${job.id}: trying durl-byte-range before dash-single fallback`);
+            this.logger.log(`Job ${job.id}: strategy fallback dash-byte-range -> durl-byte-range (preferred over dash-single)`);
             let useParallel = false; let totalSize = 0;
             try {
               const head = await axios.head(durlUrl, { headers: commonHeaders, timeout: 5000 });
@@ -895,15 +1072,20 @@ return 1
               });
               await job.progress(95);
               didSegment = true;
+              await markDownloadMode('native', 'durl-byte-range', 'DURL supports byte-range; fallback from DASH path');
               this.logger.log(`Job ${job.id}: strategy selected durl-byte-range (preferred over dash-single)`);
             } else {
-              this.logger.debug(`Job ${job.id}: durl-byte-range not applicable; continue to dash-single`);
+              this.logger.debug(
+                `Job ${job.id}: durl-byte-range not applicable (useParallel=${useParallel}, totalSize=${totalSize}); ` +
+                `fallback to dash-single`,
+              );
             }
           }
         }
 
         // fallback: if we didn't do segmented path, download whole video+audio as before
         if (!didSegment) {
+          this.logger.debug(`Job ${job.id}: strategy fallback to dash-single (segmented/byte-range paths not applicable)`);
           const singlePermit = await this.acquireSingleDownloadPermit(job);
           try {
           if (cancelRequested) { await this.history.appendEvent(job.id.toString(), { state: 'cancelled', progress: 0 }); this.logger.log(`Job ${job.id} cancelled before download start`); return { cancelled: true }; }
@@ -1008,6 +1190,8 @@ return 1
             mediaRequested,
             mediaEffective: mediaPlan.effective,
             mediaFallbackReason: mediaPlan.fallbackReason || null,
+            downloadEngine,
+            downloadMode,
           },
         });
         this.cleanupJobTempArtifacts(String(job.id), finalPath);
@@ -1020,16 +1204,26 @@ return 1
           mediaRequested,
           mediaEffective: mediaPlan.effective,
           mediaFallbackReason: mediaPlan.fallbackReason || null,
+          downloadEngine,
+          downloadMode,
         };
       }
 
       // existing durl (single url / byte-range) flow remains unchanged
       if (play.data?.durl?.length) {
+        await markDownloadMode('native', 'durl-single', 'only DURL stream path available');
         if (resolvedQn > 0 && resolvedQn < qualityPolicy.minAcceptableQn) {
-          throw new Error(
-            `durl quality qn=${resolvedQn} is below accepted minimum ` +
-              `${qualityPolicy.minAcceptableQn} for prefer=${qualityPolicy.preferredLabel}`,
-          );
+          if (platform === 'youtube') {
+            this.logger.warn(
+              `Job ${job.id}: youtube durl quality qn=${resolvedQn} is below configured minimum ` +
+                `${qualityPolicy.minAcceptableQn}; continuing with best available stream`,
+            );
+          } else {
+            throw new Error(
+              `durl quality qn=${resolvedQn} is below accepted minimum ` +
+                `${qualityPolicy.minAcceptableQn} for prefer=${qualityPolicy.preferredLabel}`,
+            );
+          }
         }
         const url = play.data.durl[0].url;
         const tempOutFile = path.join(this['dataDir'], `${vid}-${job.id}.mp4`);
@@ -1109,6 +1303,7 @@ return 1
             await this.releaseSingleDownloadPermit(singlePermit);
           }
         } else {
+          await markDownloadMode('native', 'durl-byte-range', 'DURL accepts byte-range with valid 206 probe');
           const partSize = partSizeBytes; const partCount = Math.ceil(totalSize / partSize); const partsDir = path.join(manifestDir, 'parts'); if (!fs.existsSync(manifestDir)) fs.mkdirSync(manifestDir, { recursive: true }); if (!fs.existsSync(partsDir)) fs.mkdirSync(partsDir, { recursive: true });
           const parts: any[] = [];
           for (let i = 0; i < partCount; i++) { const start = i * partSize; const end = Math.min(totalSize - 1, (i + 1) * partSize - 1); const expectedBytes = end - start + 1; parts.push({ partIndex: i, rangeStart: start, rangeEnd: end, expectedBytes, state: 'pending', downloadedBytes: 0 }); }
@@ -1219,6 +1414,8 @@ return 1
             mediaRequested,
             mediaEffective: mediaPlan.effective,
             mediaFallbackReason: mediaPlan.fallbackReason || null,
+            downloadEngine,
+            downloadMode,
           },
         });
         this.cleanupJobTempArtifacts(String(job.id), finalPath);
@@ -1231,6 +1428,8 @@ return 1
           mediaRequested,
           mediaEffective: mediaPlan.effective,
           mediaFallbackReason: mediaPlan.fallbackReason || null,
+          downloadEngine,
+          downloadMode,
         };
       }
 
@@ -1240,6 +1439,67 @@ return 1
       if (recovered) return recovered;
       const recoveredSingle = await this.tryFinalizeSingleModeArtifacts(job, payload, manifestDir, manifestPath);
       if (recoveredSingle) return recoveredSingle;
+      if (requestedEngine === 'auto' && nativeAttempted && ytDlpFallbackContext) {
+        this.logger.warn(
+          `Job ${job.id}: native download failed at mode=${downloadMode} (${String(err?.message || err)}), ` +
+            `fallback to yt-dlp`,
+        );
+        await this.history.appendEvent(String(job.id), {
+          state: 'download-mode',
+          progress: Number(await job.progress()) || 0,
+          downloadEngine: 'yt-dlp',
+          downloadMode: 'yt-dlp-fallback',
+          fromEngine: downloadEngine,
+          fromMode: downloadMode,
+          reason: 'native attempt failed under engine=auto',
+        });
+        const ytDlpFallback = await this.tryDirectDownloadViaYtDlp({
+          job,
+          requestUrl: ytDlpFallbackContext.requestUrl,
+          platform: ytDlpFallbackContext.platform,
+          vid: ytDlpFallbackContext.vid,
+          title: ytDlpFallbackContext.title,
+          safeTitle: ytDlpFallbackContext.safeTitle,
+          mediaEffective: ytDlpFallbackContext.mediaEffective,
+          cookies: ytDlpFallbackContext.cookies,
+          manifestDir,
+          stopRequested: () => false,
+          cancelRequested: () => false,
+        });
+        if (ytDlpFallback?.path) {
+          await job.progress(100);
+          await this.history.appendEvent(String(job.id), {
+            state: 'finished',
+            progress: 100,
+            result: {
+              path: ytDlpFallback.path,
+              platform: ytDlpFallbackContext.platform,
+              vid: ytDlpFallbackContext.vid,
+              title: ytDlpFallbackContext.title,
+              mediaRequested: ytDlpFallbackContext.mediaRequested,
+              mediaEffective: ytDlpFallbackContext.mediaEffective,
+              mediaFallbackReason: ytDlpFallbackContext.mediaFallbackReason,
+              downloadEngine: 'yt-dlp',
+              downloadMode: 'yt-dlp-fallback',
+            },
+          });
+          this.cleanupJobTempArtifacts(String(job.id), ytDlpFallback.path);
+          this.logger.log(
+            `Job ${job.id} finished in ${formatElapsedDuration(Date.now() - jobStartedAt)}, output: ${ytDlpFallback.path} (engine=yt-dlp,fallback=native-failed)`,
+          );
+          return {
+            path: ytDlpFallback.path,
+            platform: ytDlpFallbackContext.platform,
+            vid: ytDlpFallbackContext.vid,
+            title: ytDlpFallbackContext.title,
+            mediaRequested: ytDlpFallbackContext.mediaRequested,
+            mediaEffective: ytDlpFallbackContext.mediaEffective,
+            mediaFallbackReason: ytDlpFallbackContext.mediaFallbackReason,
+            downloadEngine: 'yt-dlp',
+            downloadMode: 'yt-dlp-fallback',
+          };
+        }
+      }
       this.logger.error(`Job ${job.id} failed: ${err?.message || err}`);
       try { await job.progress(0); } catch (e) { }
       try { await this.history.appendEvent(job.id.toString(), { state: 'failed', progress: 0, message: err?.message }); } catch (e) { }
@@ -1439,6 +1699,8 @@ return 1
           mediaRequested,
           mediaEffective,
           mediaFallbackReason,
+          downloadEngine: 'native',
+          downloadMode: String(manifest?.strategy || 'native-recovered'),
           recoveredFromManifest: true,
         },
       });
@@ -1452,6 +1714,8 @@ return 1
         mediaRequested,
         mediaEffective,
         mediaFallbackReason,
+        downloadEngine: 'native',
+        downloadMode: String(manifest?.strategy || 'native-recovered'),
         recoveredFromManifest: true,
       };
     } catch {
@@ -1530,6 +1794,8 @@ return 1
           mediaRequested,
           mediaEffective,
           mediaFallbackReason,
+          downloadEngine: 'native',
+          downloadMode: 'native-single-recovered',
           recoveredFromSingleArtifacts: true,
         },
       });
@@ -1543,6 +1809,8 @@ return 1
         mediaRequested,
         mediaEffective,
         mediaFallbackReason,
+        downloadEngine: 'native',
+        downloadMode: 'native-single-recovered',
         recoveredFromSingleArtifacts: true,
       };
     } catch {
@@ -1944,6 +2212,242 @@ return 1
     throw new Error('unreachable');
   }
 
+  private async tryDirectDownloadViaYtDlp(params: {
+    job: Job;
+    requestUrl: string;
+    platform: ConcretePlatform;
+    vid: string;
+    title: string;
+    safeTitle: string;
+    mediaEffective: MediaMode;
+    cookies: string;
+    manifestDir: string;
+    stopRequested: () => boolean;
+    cancelRequested: () => boolean;
+  }): Promise<{ path?: string; stopped?: boolean; cancelled?: boolean } | null> {
+    const {
+      job,
+      requestUrl,
+      platform,
+      vid,
+      safeTitle,
+      mediaEffective,
+      cookies,
+      manifestDir,
+      stopRequested,
+      cancelRequested,
+    } = params;
+    if (!requestUrl) return null;
+    const binaries = ['/usr/local/bin/yt-dlp', '/usr/bin/yt-dlp', 'yt-dlp'];
+    const outputTemplate = path.join(manifestDir, `${job.id}-yt-dlp.%(ext)s`);
+    const formatSelector = mediaEffective === 'audio'
+      ? 'bestaudio/b'
+      : mediaEffective === 'video'
+        ? 'bv*/b'
+        : 'bv*+ba/b';
+    const configuredParallel = Number(this.runtimeConfig.getForSource(platform, 'download.parallelMaxConcurrentDownloads') ?? 10);
+    const concurrentFragments = Math.max(1, Math.min(32, Math.floor(configuredParallel) || 1));
+
+    for (const bin of binaries) {
+      const args = [
+        '--newline',
+        '--progress',
+        '--no-warnings',
+        '--no-playlist',
+        '--concurrent-fragments',
+        String(concurrentFragments),
+        '-f',
+        formatSelector,
+        '-o',
+        outputTemplate,
+      ];
+      if (mediaEffective === 'both' || mediaEffective === 'video') {
+        args.push('--merge-output-format', 'mp4');
+      }
+      if (mediaEffective === 'audio') {
+        args.push('--extract-audio', '--audio-format', 'm4a');
+      }
+      const cookieHeader = String(cookies || '').trim();
+      if (cookieHeader) args.push('--add-header', `Cookie:${cookieHeader}`);
+      args.push(requestUrl);
+
+      let killedBySignal = false;
+      let stage = 'starting';
+      let lastProgressEmitAt = 0;
+      let lastPercent = -1;
+      let lastHistoryBucket = -1;
+      let lastMappedProgress = 12;
+      let downloadPass = 1;
+      let lastPassResetAt = 0;
+      const recentToolLines: Array<{ stream: 'stdout' | 'stderr'; line: string }> = [];
+      const rememberToolLine = (stream: 'stdout' | 'stderr', line: string): void => {
+        const clean = String(line || '').trim();
+        if (!clean) return;
+        recentToolLines.push({ stream, line: clean });
+        if (recentToolLines.length > 80) recentToolLines.shift();
+      };
+
+      const mapProgress = (currentStage: string, percent: number): number => {
+        if (currentStage === 'downloading') return Math.max(15, Math.min(92, Math.floor(15 + (percent * 0.77))));
+        if (currentStage === 'merging' || currentStage === 'extracting') return Math.max(92, Math.min(98, Math.floor(92 + (percent * 0.06))));
+        return 15;
+      };
+      const setStage = async (next: string): Promise<void> => {
+        if (stage === next) return;
+        stage = next;
+        this.logger.debug(`Job ${job.id}: yt-dlp stage=${stage}`);
+        await this.history.appendEvent(String(job.id), { state: 'yt-dlp-stage', progress: await job.progress(), stage });
+      };
+
+      try {
+        await this.history.appendEvent(String(job.id), { state: 'yt-dlp-start', progress: 12 });
+        this.logger.debug(
+          `Job ${job.id}: yt-dlp options format=${formatSelector} concurrentFragments=${concurrentFragments} platform=${platform}`,
+        );
+        const child = spawn(bin, args, { stdio: ['ignore', 'pipe', 'pipe'] });
+        const monitor = setInterval(() => {
+          if (cancelRequested()) {
+            killedBySignal = true;
+            try { child.kill('SIGTERM'); } catch {}
+          } else if (stopRequested()) {
+            killedBySignal = true;
+            try { child.kill('SIGTERM'); } catch {}
+          }
+        }, 300);
+
+        const onLine = async (lineRaw: string, stream: 'stdout' | 'stderr'): Promise<void> => {
+          const line = String(lineRaw || '').trim();
+          if (!line) return;
+          rememberToolLine(stream, line);
+          if (line.includes('[download]')) await setStage('downloading');
+          if (line.includes('[Merger]') || line.toLowerCase().includes('merging formats')) await setStage('merging');
+          if (line.includes('[ExtractAudio]')) await setStage('extracting');
+
+          const m = line.match(/(\d+(?:\.\d+)?)%/);
+          if (!m) return;
+          const pct = Number(m[1]);
+          if (!Number.isFinite(pct)) return;
+          const now = Date.now();
+          const looksLikeNewPass = stage === 'downloading'
+            && lastPercent >= 90
+            && pct <= 5
+            && now - lastPassResetAt > 1000;
+          if (looksLikeNewPass) {
+            downloadPass += 1;
+            lastHistoryBucket = -1;
+            lastPassResetAt = now;
+            this.logger.debug(`Job ${job.id}: yt-dlp started download pass ${downloadPass} (progress reset ${lastPercent.toFixed(1)}% -> ${pct.toFixed(1)}%)`);
+            await this.history.appendEvent(String(job.id), {
+              state: 'yt-dlp-download-pass',
+              progress: lastMappedProgress,
+              pass: downloadPass,
+            });
+          }
+          if (Math.abs(pct - lastPercent) < 0.5 && now - lastProgressEmitAt < 1500) return;
+          lastPercent = pct;
+          lastProgressEmitAt = now;
+          const mapped = Math.max(lastMappedProgress, mapProgress(stage, pct));
+          lastMappedProgress = mapped;
+          await job.progress(mapped);
+          this.logger.debug(`Job ${job.id}: yt-dlp stage=${stage} pass=${downloadPass} progress=${pct.toFixed(1)}%`);
+          const historyBucket = Math.floor(pct / 10);
+          if (historyBucket > lastHistoryBucket) {
+            lastHistoryBucket = historyBucket;
+            await this.history.appendEvent(String(job.id), {
+              state: 'yt-dlp-progress',
+              progress: mapped,
+              stage,
+              pass: downloadPass,
+              downloadedPercent: Number(pct.toFixed(1)),
+            });
+          }
+        };
+
+        const rlOut = createInterface({ input: child.stdout });
+        const rlErr = createInterface({ input: child.stderr });
+        let lineQueue = Promise.resolve();
+        const enqueueLine = (line: string, stream: 'stdout' | 'stderr'): void => {
+          lineQueue = lineQueue
+            .then(() => onLine(line, stream))
+            .catch(() => undefined);
+        };
+        rlOut.on('line', (line) => { enqueueLine(line, 'stdout'); });
+        rlErr.on('line', (line) => { enqueueLine(line, 'stderr'); });
+
+        const exitCode = await new Promise<number>((resolve, reject) => {
+          child.on('error', reject);
+          child.on('close', (code) => resolve(Number(code ?? 1)));
+        });
+        clearInterval(monitor);
+        rlOut.close();
+        rlErr.close();
+
+        if (killedBySignal) {
+          if (cancelRequested()) return { cancelled: true };
+          if (stopRequested()) return { stopped: true };
+        }
+        if (exitCode !== 0) {
+          throw new Error(`yt-dlp exited with code ${exitCode}`);
+        }
+
+        const entries = fs.readdirSync(manifestDir)
+          .filter((name) => name.startsWith(`${job.id}-yt-dlp.`))
+          .map((name) => {
+            const full = path.join(manifestDir, name);
+            let mtime = 0;
+            try { mtime = fs.statSync(full).mtimeMs; } catch {}
+            return { full, name, mtime };
+          })
+          .sort((a, b) => b.mtime - a.mtime);
+        const selected = entries[0]?.full || '';
+        if (!selected || !fs.existsSync(selected)) {
+          throw new Error('yt-dlp completed but output file was not found');
+        }
+        const ext = path.extname(selected).replace('.', '').trim() || (mediaEffective === 'audio' ? 'm4a' : 'mp4');
+        const finalDir = path.join(this.resultDir, platform, safeTitle);
+        if (!fs.existsSync(finalDir)) fs.mkdirSync(finalDir, { recursive: true });
+        const finalPath = path.join(finalDir, `${vid}-${job.id}.${ext}`);
+        if (selected !== finalPath) fs.renameSync(selected, finalPath);
+        await job.progress(99);
+        await this.history.appendEvent(String(job.id), {
+          state: 'yt-dlp-finished',
+          progress: 99,
+          path: finalPath,
+          downloadEngine: 'yt-dlp',
+          downloadMode: 'yt-dlp-direct',
+        });
+        return { path: finalPath };
+      } catch (e: any) {
+        if (String(e?.code || '') === 'ENOENT') continue;
+        if (cancelRequested()) return { cancelled: true };
+        if (stopRequested()) return { stopped: true };
+        const deprecationPattern = /deprecated feature/i;
+        const progressNoisePattern = /^\[download\]\s+\d+(?:\.\d+)?%/i;
+        const significantPattern = /(error|unable|forbidden|denied|unsupported|not available|private|login|sign in|captcha|http error|403|429|extractor|failed)/i;
+        const lines = recentToolLines.map((x) => x.line);
+        const significant = lines.filter((line) =>
+          !deprecationPattern.test(line)
+          && !progressNoisePattern.test(line)
+          && significantPattern.test(line),
+        );
+        const fallbackContext = lines.filter((line) => !progressNoisePattern.test(line));
+        const context = (significant.length > 0 ? significant : fallbackContext).slice(-4);
+        const contextText = context.length > 0 ? context.join(' | ') : '';
+        const detail = contextText ? `${String(e?.message || e)} | yt-dlp: ${contextText}` : String(e?.message || e);
+        this.logger.warn(`Job ${job.id}: yt-dlp direct download failed (${detail}), fallback to native downloader`);
+        await this.history.appendEvent(String(job.id), {
+          state: 'yt-dlp-failed',
+          progress: 12,
+          message: detail,
+        });
+        return null;
+      }
+    }
+    this.logger.warn(`Job ${params.job.id}: yt-dlp binary not found, fallback to native downloader`);
+    await this.history.appendEvent(String(params.job.id), { state: 'yt-dlp-unavailable', progress: 12 });
+    return null;
+  }
+
   // Folder title rule:
   // - Latin/Vietnamese: remove accents, lowercase, spaces -> '-'
   // - Chinese: keep original text
@@ -1999,18 +2503,6 @@ return 1
       return translated || null;
     } catch (e) {
       this.logger.warn(`Failed to translate title to Vietnamese: ${e instanceof Error ? e.message : String(e)}`);
-      return null;
-    }
-  }
-
-  private async fetchVideoTitle(vid: string, cookies?: string): Promise<string | null> {
-    try {
-      const headers: Record<string, string> = {};
-      if (cookies) headers.Cookie = cookies;
-      const resp = await axios.get('https://api.bilibili.com/x/web-interface/view', { params: { vid }, headers, timeout: 5000 });
-      return resp.data?.data?.title || null;
-    } catch (e) {
-      this.logger.warn(`Failed to fetch video title for ${vid}: ${e instanceof Error ? e.message : String(e)}`);
       return null;
     }
   }

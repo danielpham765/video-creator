@@ -80,6 +80,13 @@ download:
   retryCount: 3
   # Toggle resumable downloads on/off (ENV: RESUME_DOWNLOAD_ENABLED)
   resumeEnabled: true
+  # Default download engine.
+  # Allowed: auto | yt-dlp | native
+  # - auto: try native first, fallback to yt-dlp
+  # - yt-dlp: use yt-dlp only
+  # - native: use built-in downloader only
+  # ENV: DOWNLOAD_ENGINE
+  engine: auto
   # Preferred video quality across all sources.
   # Allowed: 2160p, 1440p, 1080p, 720p, 480p, 360p
   # Selection policy:

@@ -117,10 +117,17 @@ export class JobArchiveService implements OnModuleInit, OnModuleDestroy {
     try {
       const masterJob = await this.downloadQueue.getJob(jobId as any);
       const masterRaw = await this.safeHgetAll(redisClient, `bull:downloads:${jobId}`);
+      const queueState = await this.resolveMasterQueueState(jobId, masterJob, masterRaw || {}, redisClient);
+      if (this.hasRetryPending(masterJob, masterRaw || {}, queueState)) {
+        return { archived: false, skippedReason: 'retry-pending' };
+      }
       const history = await this.history.getHistory(jobId);
       const partsProgressRaw = (await this.safeHgetAll(redisClient, `job:parts:${jobId}`)) || {};
       const partIds = await this.findRelatedPartJobIds(jobId, redisClient);
       const partJobsRaw = await this.readPartJobs(partIds, redisClient);
+      if (this.hasInFlightPartJobs(partJobsRaw)) {
+        return { archived: false, skippedReason: 'parts-inflight' };
+      }
       const hasRecoverableArtifacts = Boolean(
         (Array.isArray(history) && history.length > 0)
         || Object.keys(partsProgressRaw).length > 0
@@ -272,7 +279,8 @@ export class JobArchiveService implements OnModuleInit, OnModuleDestroy {
   ): Record<string, any> {
     const data = masterJob?.data || this.safeJsonParse(masterRaw?.data, {});
     const result = masterJob?.returnvalue || this.safeJsonParse(masterRaw?.returnvalue, null);
-    const failedReason = masterJob?.failedReason || masterRaw?.failedReason || null;
+    const failedReasonRaw = masterJob?.failedReason || masterRaw?.failedReason || null;
+    const failedReason = state === 'failed' ? failedReasonRaw : null;
     const progressRaw = masterJob ? masterJob._progress : masterRaw?.progress;
     const progress = Number(progressRaw || 0) || 0;
     return {
@@ -427,6 +435,17 @@ export class JobArchiveService implements OnModuleInit, OnModuleDestroy {
     return { total, failed, stateCounts };
   }
 
+  private hasInFlightPartJobs(partJobsRaw: any[]): boolean {
+    if (!Array.isArray(partJobsRaw) || partJobsRaw.length === 0) return false;
+    for (const p of partJobsRaw) {
+      const states: string[] = Array.isArray(p?.memberships) ? p.memberships.map((s: any) => String(s || '').toLowerCase()) : [];
+      if (states.includes('active') || states.includes('wait') || states.includes('delayed') || states.includes('paused')) {
+        return true;
+      }
+    }
+    return false;
+  }
+
   private inferTerminalStateFromArtifacts(
     history: any[],
     partJobsRaw: any[],
@@ -492,6 +511,50 @@ export class JobArchiveService implements OnModuleInit, OnModuleDestroy {
     } catch {
       return fallback;
     }
+  }
+
+  private hasRetryPending(masterJob: any, masterRaw: Record<string, any>, queueState: string | null): boolean {
+    const fromJobAttempts = Number(masterJob?.opts?.attempts);
+    const fromRawOpts = this.safeJsonParse(masterRaw?.opts, {});
+    const fromRawAttempts = Number(fromRawOpts?.attempts);
+    const attempts = Number.isFinite(fromJobAttempts) && fromJobAttempts > 0
+      ? fromJobAttempts
+      : (Number.isFinite(fromRawAttempts) && fromRawAttempts > 0 ? fromRawAttempts : 1);
+
+    const fromJobAttemptsMade = Number(masterJob?.attemptsMade);
+    const fromRawAttemptsMade = Number(masterRaw?.attemptsMade);
+    const attemptsMade = Number.isFinite(fromJobAttemptsMade) && fromJobAttemptsMade >= 0
+      ? fromJobAttemptsMade
+      : (Number.isFinite(fromRawAttemptsMade) && fromRawAttemptsMade >= 0 ? fromRawAttemptsMade : 0);
+
+    if (attemptsMade >= attempts) return false;
+    const s = String(queueState || '').toLowerCase();
+    return s === 'failed' || s === 'delayed' || s === 'wait' || s === 'active' || s === 'paused';
+  }
+
+  private async resolveMasterQueueState(
+    jobId: string,
+    masterJob: any,
+    masterRaw: Record<string, any>,
+    redisClient: any,
+  ): Promise<string | null> {
+    if (masterJob) {
+      try {
+        const state = String(await masterJob.getState());
+        if (state) return state;
+      } catch {}
+    }
+
+    if (!redisClient) return null;
+    for (const state of MASTER_STATE_KEYS) {
+      try {
+        const score = await redisClient.zscore(`bull:downloads:${state}`, jobId);
+        if (score !== null && score !== undefined) return state;
+      } catch {}
+    }
+
+    if (masterRaw?.failedReason) return 'failed';
+    return null;
   }
 
   private async safeHgetAll(redisClient: any, key: string): Promise<Record<string, any> | null> {

@@ -48,6 +48,22 @@ export interface SourceResolver {
   resolve(input: ResolveSourceInput): Promise<ResolvedSource>;
 }
 
+export interface PlayurlResolveInput {
+  vid: string;
+  page: number;
+  cookies?: string;
+}
+
+export interface PlayurlResolveResult {
+  cid: string | number;
+  play: any;
+}
+
+export interface SourcePlayurlProvider {
+  readonly platform: ConcretePlatform;
+  resolvePlayurl(input: PlayurlResolveInput): Promise<PlayurlResolveResult>;
+}
+
 export interface MediaPlan {
   requested: MediaMode;
   effective: MediaMode;

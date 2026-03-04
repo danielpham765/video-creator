@@ -5,7 +5,7 @@ export const downloadSwagger = {
     startDownload: {
       operation: {
         summary: 'Start a download job',
-        description: 'Submit a URL and optional options (title, page, platform, media mode) to enqueue a new download.',
+        description: 'Submit a URL and optional options (title, page, platform, media mode, engine) to enqueue a new download.',
       },
       body: {
         type: CreateDownloadDto,

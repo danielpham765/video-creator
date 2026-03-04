@@ -2,7 +2,6 @@ import { Module } from '@nestjs/common';
 import { BullModule } from '@nestjs/bull';
 import { WorkerProcessor } from './worker.processor';
 import { PartsProcessor } from './parts.processor';
-import { PlayurlModule } from '../playurl/playurl.module';
 import { FfmpegModule } from '../ffmpeg/ffmpeg.module';
 import { JobsModule } from '../jobs/jobs.module';
 import { JobArchiveService } from '../jobs/job-archive.service';
@@ -21,7 +20,6 @@ import { SourceModule } from '../source/source.module';
       },
       inject: [ConfigService],
     }),
-    PlayurlModule,
     SourceModule,
     FfmpegModule,
     BullModule.registerQueue({ name: 'downloads' }, { name: 'download-parts' }),

@@ -1,7 +1,7 @@
 download:
   # Size per part when splitting (in megabytes). Default: 8 (ENV: PART_SIZE_BYTES)
   # Note: application should interpret this value as MB and convert to bytes.
-  partSizeBytes: 64
+  partSizeBytes: 16
   # Per-process cap for parallel strategies:
   # - dash-segmented
   # - durl-byte-range

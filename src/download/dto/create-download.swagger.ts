@@ -23,4 +23,9 @@ export const createDownloadDtoSwagger = {
     enum: ['both', 'video', 'audio'],
     default: 'both',
   },
+  engine: {
+    description: 'Download engine strategy. auto tries native first then yt-dlp fallback.',
+    enum: ['auto', 'yt-dlp', 'native'],
+    default: 'auto',
+  },
 } as const;

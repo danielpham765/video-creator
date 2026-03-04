@@ -318,6 +318,7 @@ export class RuntimeConfigEngine {
     this.assertPositiveInt(snapshot.globalDefault, 'download.timeoutMs');
     this.assertNonNegativeInt(snapshot.globalDefault, 'download.retryCount');
     this.assertNonNegativeInt(snapshot.globalDefault, 'download.retryBackoffMs');
+    this.assertDownloadEngine(snapshot.globalDefault, 'download.engine');
     this.assertVideoQuality(snapshot.globalDefault, 'download.preferVideoQuality');
     this.assertPositiveInt(snapshot.globalDefault, 'playurl.timeoutMs');
     this.assertPositiveInt(snapshot.globalDefault, 'logging.rotate.maxFileSizeMb');
@@ -328,6 +329,7 @@ export class RuntimeConfigEngine {
       this.assertPositiveInt(cfg, 'download.timeoutMs', source);
       this.assertNonNegativeInt(cfg, 'download.retryCount', source);
       this.assertNonNegativeInt(cfg, 'download.retryBackoffMs', source);
+      this.assertDownloadEngine(cfg, 'download.engine', source);
       this.assertVideoQuality(cfg, 'download.preferVideoQuality', source);
       this.assertPositiveInt(cfg, 'playurl.timeoutMs', source);
       this.assertPositiveInt(cfg, 'logging.rotate.maxFileSizeMb', source);
@@ -372,6 +374,17 @@ export class RuntimeConfigEngine {
     const hint = source ? ` for source ${source}` : '';
     throw new Error(
       `invalid ${pathExpr}${hint}: expected one of 2160p, 1440p, 1080p, 720p, 480p, 360p; got ${String(value)}`,
+    );
+  }
+
+  private assertDownloadEngine(obj: Record<string, any>, pathExpr: string, source?: string): void {
+    const value = this.deepGet(obj, pathExpr);
+    if (value === undefined || value === null || value === '') return;
+    const normalized = String(value).trim().toLowerCase();
+    if (normalized === 'auto' || normalized === 'yt-dlp' || normalized === 'native') return;
+    const hint = source ? ` for source ${source}` : '';
+    throw new Error(
+      `invalid ${pathExpr}${hint}: expected one of auto, yt-dlp, native; got ${String(value)}`,
     );
   }
 

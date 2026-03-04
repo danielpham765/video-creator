@@ -1,5 +1,7 @@
 import { Injectable } from '@nestjs/common';
 import axios from 'axios';
+import { execFile } from 'child_process';
+import { promisify } from 'util';
 import { BilibiliResolver } from './bilibili.resolver';
 import { YouTubeResolver } from './youtube.resolver';
 import { ResolveSourceInput, ResolvedSource, SourceResolver } from '../source.types';
@@ -7,6 +9,7 @@ import { ResolveSourceInput, ResolvedSource, SourceResolver } from '../source.ty
 @Injectable()
 export class GenericResolver implements SourceResolver {
   readonly platform = 'generic' as const;
+  private readonly execFileAsync = promisify(execFile);
 
   constructor(
     private readonly bilibiliResolver: BilibiliResolver,
@@ -55,6 +58,9 @@ export class GenericResolver implements SourceResolver {
       return this.bilibiliResolver.resolve({ ...input, url: embeddedBilibili, platform: 'bilibili' });
     }
 
+    const viaYtDlp = await this.resolveViaYtDlp(url, input.title, input.cookies);
+    if (viaYtDlp) return viaYtDlp;
+
     const mediaSrc = this.matchFirst(html, [
       /<meta[^>]+property=["']og:video["'][^>]+content=["']([^"']+)["']/i,
       /<source[^>]+src=["']([^"']+)["']/i,
@@ -67,6 +73,80 @@ export class GenericResolver implements SourceResolver {
     }
 
     throw new Error('unsupported source: unable to resolve playable media streams from URL/page');
+  }
+
+  private async resolveViaYtDlp(url: string, title?: string, cookies?: string): Promise<ResolvedSource | null> {
+    const candidates = ['/usr/local/bin/yt-dlp', '/usr/bin/yt-dlp', 'yt-dlp'];
+    for (const bin of candidates) {
+      try {
+        const args = ['-J', '--no-playlist', '--no-warnings'];
+        const cookieHeader = String(cookies || '').trim();
+        if (cookieHeader) args.push('--add-header', `Cookie:${cookieHeader}`);
+        args.push(url);
+
+        const { stdout } = await this.execFileAsync(bin, args, {
+          timeout: 30000,
+          maxBuffer: 10 * 1024 * 1024,
+        });
+        const parsed: any = JSON.parse(String(stdout || '{}'));
+        const canonicalUrl = String(parsed?.webpage_url || url).trim() || url;
+        const resolvedTitle = String(title || parsed?.title || this.defaultTitle(canonicalUrl)).trim();
+        const headers = this.toHeaderRecord(parsed?.http_headers);
+
+        const requestedFormats = Array.isArray(parsed?.requested_formats) ? parsed.requested_formats : [];
+        const videoFormat = requestedFormats.find((f: any) => String(f?.vcodec || 'none') !== 'none');
+        const audioFormat = requestedFormats.find(
+          (f: any) => String(f?.acodec || 'none') !== 'none' && String(f?.vcodec || 'none') === 'none',
+        );
+        const dashVideoUrl = String(videoFormat?.url || '').trim();
+        const dashAudioUrl = String(audioFormat?.url || '').trim();
+        const muxedUrl = String(parsed?.url || '').trim();
+
+        if (dashVideoUrl && dashAudioUrl) {
+          return {
+            platform: 'generic',
+            vid: this.fingerprint(canonicalUrl),
+            canonicalUrl,
+            title: resolvedTitle,
+            headers,
+            streams: {
+              dashPair: { videoUrl: dashVideoUrl, audioUrl: dashAudioUrl },
+              videoOnly: { url: dashVideoUrl },
+              audioOnly: { url: dashAudioUrl },
+            },
+          };
+        }
+        if (muxedUrl) {
+          return {
+            platform: 'generic',
+            vid: this.fingerprint(canonicalUrl),
+            canonicalUrl,
+            title: resolvedTitle,
+            headers,
+            streams: {
+              muxedBoth: { url: muxedUrl },
+              videoOnly: { url: muxedUrl },
+            },
+          };
+        }
+      } catch (e: any) {
+        if (String(e?.code || '') === 'ENOENT') continue;
+        return null;
+      }
+    }
+    return null;
+  }
+
+  private toHeaderRecord(input: any): Record<string, string> {
+    const out: Record<string, string> = {};
+    if (!input || typeof input !== 'object' || Array.isArray(input)) return out;
+    for (const [key, value] of Object.entries(input)) {
+      const k = String(key || '').trim();
+      const v = String(value || '').trim();
+      if (!k || !v) continue;
+      out[k] = v;
+    }
+    return out;
   }
 
   private buildDirectMediaSource(url: string, title?: string, contentType?: string): ResolvedSource {

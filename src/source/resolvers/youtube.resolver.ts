@@ -1,4 +1,4 @@
-import { Injectable } from '@nestjs/common';
+import { Injectable, Logger } from '@nestjs/common';
 import axios from 'axios';
 import { execFile } from 'child_process';
 import { promisify } from 'util';
@@ -11,6 +11,7 @@ import { buildVideoQualityPolicy } from '../video-quality';
 @Injectable()
 export class YouTubeResolver implements SourceResolver {
   readonly platform = 'youtube' as const;
+  private readonly logger = new Logger(YouTubeResolver.name);
   private readonly execFileAsync = promisify(execFile);
   constructor(private readonly runtimeConfig: RuntimeConfigService) {}
 
@@ -27,82 +28,22 @@ export class YouTubeResolver implements SourceResolver {
       if (!vid) throw new Error('unsupported youtube url: missing video id');
 
       const canonicalUrl = `https://www.youtube.com/watch?v=${vid}`;
-
-      const ytdlClients = this.loadYtdlClients();
       const requestHeaders = this.buildRequestHeaders(input);
-      const ytdlOptions = this.buildYtdlOptions(requestHeaders);
-      let info: any = null;
-      const errors: string[] = [];
-      for (const client of ytdlClients) {
-        const name = String(client?.name || 'ytdl-client');
-        try {
-          info = await this.getInfoWithTimeout(client.client, canonicalUrl, ytdlOptions, 20000);
-          break;
-        } catch (e: any) {
-          errors.push(`${name}: ${String(e?.message || e)}`);
-        }
-      }
-      if (!info) {
-        throw new Error(`youtube resolver failed to extract stream info (${errors.join(' | ')})`);
-      }
-      const formats: any[] = Array.isArray(info?.formats) ? info.formats : [];
-
-    const audioOnly = formats
-      .filter((f) => f?.hasAudio && !f?.hasVideo && f?.url)
-      .sort((a, b) => Number(b?.audioBitrate || 0) - Number(a?.audioBitrate || 0))[0];
-
-    const qualityPolicy = buildVideoQualityPolicy(
-      this.runtimeConfig.getForSource('youtube', 'download.preferVideoQuality'),
-    );
-    const videoOnly = this.selectPreferredVideoFormat(
-      formats.filter((f) => f?.hasVideo && !f?.hasAudio && f?.url),
-      qualityPolicy.preferredQn,
-      qualityPolicy.minAcceptableQn,
-    );
-
-    const muxedBoth = this.selectPreferredVideoFormat(
-      formats.filter((f) => f?.hasVideo && f?.hasAudio && f?.url),
-      qualityPolicy.preferredQn,
-      qualityPolicy.minAcceptableQn,
-    );
-    if (!videoOnly && !muxedBoth) {
-      throw new Error(
-        `youtube resolver: no stream matches prefer=${qualityPolicy.preferredLabel} ` +
-          `(required qn ${qualityPolicy.minAcceptableQn}-${qualityPolicy.preferredQn})`,
+      const qualityPolicy = buildVideoQualityPolicy(
+        this.runtimeConfig.getForSource('youtube', 'download.preferVideoQuality'),
       );
-    }
-
-    const selectedQualityLabel = String(videoOnly?.qualityLabel || muxedBoth?.qualityLabel || '').trim();
-    const selectedHeight = Number(videoOnly?.height || muxedBoth?.height || 0) || 0;
-    const resolvedQn = this.toQnFromYouTubeQuality(selectedQualityLabel, selectedHeight);
-
-    const canUseYtdl = await this.hasUsableStreamUrl(
-      String(muxedBoth?.url || videoOnly?.url || audioOnly?.url || '').trim(),
-      requestHeaders,
-    );
-    if (!canUseYtdl) {
-      const viaYtDlp = await this.resolveViaYtDlp(canonicalUrl, vid, input.title);
-      if (viaYtDlp) return viaYtDlp;
-      throw new Error('youtube resolver could not obtain a usable stream url (ytdl and yt-dlp both failed)');
-    }
-
-      return {
-        platform: 'youtube',
-        vid,
+      const viaYtDlp = await this.resolveViaYtDlp(
         canonicalUrl,
-        title: input.title || String(info?.videoDetails?.title || '').trim() || vid,
-        headers: requestHeaders,
-        qualityMeta: {
-          qn: resolvedQn || undefined,
-          videoQualityLabel: selectedQualityLabel || undefined,
-        },
-        streams: {
-          dashPair: videoOnly?.url && audioOnly?.url ? { videoUrl: videoOnly.url, audioUrl: audioOnly.url } : undefined,
-          videoOnly: videoOnly?.url ? { url: videoOnly.url } : undefined,
-          audioOnly: audioOnly?.url ? { url: audioOnly.url } : undefined,
-          muxedBoth: muxedBoth?.url ? { url: muxedBoth.url } : undefined,
-        },
-      };
+        vid,
+        input.title,
+        qualityPolicy.preferredQn,
+        qualityPolicy.minAcceptableQn,
+        requestHeaders,
+      );
+      if (viaYtDlp.source) return viaYtDlp.source;
+      const reason = viaYtDlp.failureReason || 'unknown reason';
+      this.logger.warn(`youtube resolve failed for vid=${vid}: ${reason}`);
+      throw new Error(`youtube resolver could not obtain a usable stream url (yt-dlp failed: ${reason})`);
     } finally {
       this.cleanupPlayerScriptArtifacts();
     }
@@ -128,19 +69,73 @@ export class YouTubeResolver implements SourceResolver {
     }
   }
 
-  private async resolveViaYtDlp(canonicalUrl: string, vid: string, preferredTitle?: string): Promise<ResolvedSource | null> {
+  private async resolveViaYtDlp(
+    canonicalUrl: string,
+    vid: string,
+    preferredTitle?: string,
+    preferredQn = 80,
+    minAcceptableQn = 64,
+    requestHeaders?: Record<string, string>,
+  ): Promise<{ source: ResolvedSource | null; failureReason: string | null }> {
+    const preferredHeight = this.toHeightFromQn(preferredQn);
+    const minAcceptableHeight = this.toHeightFromQn(minAcceptableQn);
+    const formatSelector =
+      `bv*[height<=${preferredHeight}][height>=${minAcceptableHeight}]+ba/` +
+      `b[height<=${preferredHeight}][height>=${minAcceptableHeight}]/` +
+      `bv*[height<=${preferredHeight}]+ba/b[height<=${preferredHeight}]/b`;
+    const candidates = ['/usr/local/bin/yt-dlp', '/usr/bin/yt-dlp', 'yt-dlp'];
+    const extractionErrors: string[] = [];
+    const probeFailures: string[] = [];
+    let parsed: any = null;
     try {
-      const { stdout } = await this.execFileAsync('/usr/local/bin/yt-dlp', [
-        '-J',
-        '--no-playlist',
-        '--no-warnings',
-        '-f',
-        'b[ext=mp4]/b',
-        canonicalUrl,
-      ], { timeout: 30000, maxBuffer: 10 * 1024 * 1024 });
-      const parsed: any = JSON.parse(String(stdout || '{}'));
-      const muxedUrl = String(parsed?.url || '').trim();
-      if (!muxedUrl) return null;
+      for (const bin of candidates) {
+        try {
+          const args = ['-J', '--no-playlist', '--no-warnings', '-f', formatSelector];
+          const cookieHeader = String(requestHeaders?.Cookie || '').trim();
+          const userAgentHeader = String(requestHeaders?.['User-Agent'] || '').trim();
+          const refererHeader = String(requestHeaders?.Referer || '').trim();
+          const originHeader = String(requestHeaders?.Origin || '').trim();
+          if (cookieHeader) {
+            args.push('--add-header', `Cookie:${cookieHeader}`);
+          }
+          if (userAgentHeader) {
+            args.push('--add-header', `User-Agent:${userAgentHeader}`);
+          }
+          if (refererHeader) {
+            args.push('--add-header', `Referer:${refererHeader}`);
+          }
+          if (originHeader) {
+            args.push('--add-header', `Origin:${originHeader}`);
+          }
+          args.push(canonicalUrl);
+          const { stdout } = await this.execFileAsync(
+            bin,
+            args,
+            { timeout: 30000, maxBuffer: 10 * 1024 * 1024 },
+          );
+          parsed = JSON.parse(String(stdout || '{}'));
+          if (!parsed || typeof parsed !== 'object') {
+            extractionErrors.push(`${bin}: invalid JSON payload from yt-dlp`);
+            parsed = null;
+            continue;
+          }
+          break;
+        } catch (e: any) {
+          if (String(e?.code || '') === 'ENOENT') {
+            extractionErrors.push(`${bin}: binary not found (ENOENT)`);
+            continue;
+          }
+          extractionErrors.push(`${bin}: ${this.summarizeExecFailure(e)}`);
+        }
+      }
+      if (!parsed) {
+        return {
+          source: null,
+          failureReason: extractionErrors.length
+            ? extractionErrors.join(' | ')
+            : 'yt-dlp returned no metadata',
+        };
+      }
 
       const headers: Record<string, string> = {};
       const sourceHeaders = parsed?.http_headers && typeof parsed.http_headers === 'object' ? parsed.http_headers : {};
@@ -151,57 +146,172 @@ export class YouTubeResolver implements SourceResolver {
         headers[k] = v;
       }
 
-      const usable = await this.hasUsableStreamUrl(muxedUrl, headers);
-      if (!usable) return null;
+      const requestedFormats = Array.isArray(parsed?.requested_formats) ? parsed.requested_formats : [];
+      const videoFormat = requestedFormats.find((f: any) => String(f?.vcodec || 'none') !== 'none');
+      const audioFormat = requestedFormats.find(
+        (f: any) => String(f?.acodec || 'none') !== 'none' && String(f?.vcodec || 'none') === 'none',
+      );
+      const dashVideoUrl = String(videoFormat?.url || '').trim();
+      const dashAudioUrl = String(audioFormat?.url || '').trim();
+      const muxedUrl = String(parsed?.url || '').trim();
+
+      if (dashVideoUrl && dashAudioUrl) {
+        const [videoProbe, audioProbe] = await Promise.all([
+          this.hasUsableStreamUrl(dashVideoUrl, headers),
+          this.hasUsableStreamUrl(dashAudioUrl, headers),
+        ]);
+        if (!videoProbe.ok || !audioProbe.ok) {
+          this.logger.warn(
+            `youtube stream probe blocked for vid=${vid}; continuing with yt-dlp extracted dash urls ` +
+              `(video=${videoProbe.reason}; audio=${audioProbe.reason})`,
+          );
+        }
+        return {
+          source: {
+            platform: 'youtube',
+            vid,
+            canonicalUrl,
+            title: preferredTitle || String(parsed?.title || '').trim() || vid,
+            headers,
+            qualityMeta: {
+              qn:
+                this.toQnFromYouTubeQuality(
+                  String(videoFormat?.format_note || videoFormat?.format || '').trim(),
+                  Number(videoFormat?.height || 0) || 0,
+                ) || undefined,
+              videoQualityLabel: String(videoFormat?.format_note || videoFormat?.format || '').trim() || undefined,
+            },
+            streams: {
+              dashPair: { videoUrl: dashVideoUrl, audioUrl: dashAudioUrl },
+              videoOnly: { url: dashVideoUrl },
+              audioOnly: { url: dashAudioUrl },
+            },
+          },
+          failureReason: null,
+        };
+      }
+
+      if (!muxedUrl) {
+        return {
+          source: null,
+          failureReason: probeFailures.length
+            ? probeFailures.join(' | ')
+            : 'yt-dlp metadata has no usable dash pair or muxed url',
+        };
+      }
+      const muxedProbe = await this.hasUsableStreamUrl(muxedUrl, headers);
+      if (!muxedProbe.ok) {
+        this.logger.warn(
+          `youtube muxed probe blocked for vid=${vid}; continuing with yt-dlp extracted muxed url ` +
+            `(${muxedProbe.reason})`,
+        );
+      }
 
       return {
-        platform: 'youtube',
-        vid,
-        canonicalUrl,
-        title: preferredTitle || String(parsed?.title || '').trim() || vid,
-        headers,
-        qualityMeta: {
-          qn: this.toQnFromYouTubeQuality(
-            String(parsed?.format_note || parsed?.format || '').trim(),
-            Number(parsed?.height || 0) || 0,
-          ) || undefined,
-          videoQualityLabel: String(parsed?.format_note || parsed?.format || '').trim() || undefined,
+        source: {
+          platform: 'youtube',
+          vid,
+          canonicalUrl,
+          title: preferredTitle || String(parsed?.title || '').trim() || vid,
+          headers,
+          qualityMeta: {
+            qn: this.toQnFromYouTubeQuality(
+              String(parsed?.format_note || parsed?.format || '').trim(),
+              Number(parsed?.height || 0) || 0,
+            ) || undefined,
+            videoQualityLabel: String(parsed?.format_note || parsed?.format || '').trim() || undefined,
+          },
+          streams: {
+            muxedBoth: { url: muxedUrl },
+          },
         },
-        streams: {
-          muxedBoth: { url: muxedUrl },
-        },
+        failureReason: null,
       };
-    } catch {
-      return null;
+    } catch (e: any) {
+      return {
+        source: null,
+        failureReason: `unexpected resolver error: ${this.summarizeExecFailure(e)}`,
+      };
     }
   }
 
-  private async hasUsableStreamUrl(url: string, headers: Record<string, string>): Promise<boolean> {
+  private async hasUsableStreamUrl(
+    url: string,
+    headers: Record<string, string>,
+  ): Promise<{ ok: boolean; reason: string }> {
     const target = String(url || '').trim();
-    if (!target) return false;
+    if (!target) return { ok: false, reason: 'empty url' };
     try {
-      const resp = await axios.get(target, {
+      const ranged = await axios.get(target, {
         headers: { ...headers, Range: 'bytes=0-1' },
         responseType: 'stream',
         timeout: 10000,
         validateStatus: (status: number) => status === 200 || status === 206,
       });
       try {
-        if (resp?.data && typeof resp.data.destroy === 'function') resp.data.destroy();
+        if (ranged?.data && typeof ranged.data.destroy === 'function') ranged.data.destroy();
       } catch {
         // ignore stream close errors
       }
-      return resp.status === 200 || resp.status === 206;
-    } catch {
-      return false;
+      return {
+        ok: ranged.status === 200 || ranged.status === 206,
+        reason: `ranged status=${ranged.status}`,
+      };
+    } catch (e: any) {
+      const rangedReason = this.summarizeHttpFailure(e);
+      // Some YouTube signed URLs reject byte-range probes (403) but still allow full GET.
+      // Retry once without Range and only read headers/body init to confirm reachability.
+      try {
+        const plain = await axios.get(target, {
+          headers: { ...headers },
+          responseType: 'stream',
+          timeout: 10000,
+          maxRedirects: 5,
+          validateStatus: (status: number) => status >= 200 && status < 300,
+        });
+        try {
+          if (plain?.data && typeof plain.data.destroy === 'function') plain.data.destroy();
+        } catch {
+          // ignore stream close errors
+        }
+        return {
+          ok: plain.status >= 200 && plain.status < 300,
+          reason: `ranged failed (${rangedReason}); plain status=${plain.status}`,
+        };
+      } catch (plainErr: any) {
+        return {
+          ok: false,
+          reason: `ranged failed (${rangedReason}); plain failed (${this.summarizeHttpFailure(plainErr)})`,
+        };
+      }
     }
   }
 
-  private async getInfoWithTimeout(ytdl: any, url: string, options: any, timeoutMs: number): Promise<any> {
-    return await Promise.race([
-      ytdl.getInfo(url, options),
-      new Promise((_, reject) => setTimeout(() => reject(new Error(`timeout after ${timeoutMs}ms`)), timeoutMs)),
-    ]);
+  private summarizeExecFailure(error: any): string {
+    const message = String(error?.message || error || 'unknown').replace(/\s+/g, ' ').trim();
+    const code = String(error?.code || '').trim();
+    const signal = String(error?.signal || '').trim();
+    const stderr = String(error?.stderr || '')
+      .split(/\r?\n/)
+      .map((line) => line.trim())
+      .filter(Boolean)
+      .slice(-3)
+      .join(' | ');
+    const parts = [message];
+    if (code) parts.push(`code=${code}`);
+    if (signal) parts.push(`signal=${signal}`);
+    if (stderr) parts.push(`stderr=${stderr}`);
+    return parts.join(', ');
+  }
+
+  private summarizeHttpFailure(error: any): string {
+    const status = Number(error?.response?.status || 0);
+    const statusText = String(error?.response?.statusText || '').trim();
+    const message = String(error?.message || error || 'unknown').replace(/\s+/g, ' ').trim();
+    if (status > 0) {
+      return `status=${status}${statusText ? ` ${statusText}` : ''}`;
+    }
+    return message;
   }
 
   private buildRequestHeaders(input: ResolveSourceInput): Record<string, string> {
@@ -215,39 +325,6 @@ export class YouTubeResolver implements SourceResolver {
     };
     if (input.cookies) headers.Cookie = String(input.cookies);
     return headers;
-  }
-
-  private buildYtdlOptions(headers: Record<string, string>): any {
-
-    return {
-      requestOptions: { headers },
-      playerClients: ['WEB', 'ANDROID', 'IOS'],
-      lang: 'en',
-    };
-  }
-
-  private loadYtdlClients(): Array<{ name: string; client: any }> {
-    const clients: Array<{ name: string; client: any }> = [];
-    try {
-      // eslint-disable-next-line @typescript-eslint/no-var-requires
-      clients.push({ name: '@distube/ytdl-core', client: require('@distube/ytdl-core') });
-    } catch (e) {
-      // ignore
-    }
-    try {
-      try {
-        // eslint-disable-next-line @typescript-eslint/no-var-requires
-        clients.push({ name: 'ytdl-core', client: require('ytdl-core') });
-      } catch {
-        // ignore
-      }
-    } catch {
-      // ignore
-    }
-    if (!clients.length) {
-      throw new Error('youtube resolver requires @distube/ytdl-core or ytdl-core dependency');
-    }
-    return clients;
   }
 
   private extractVideoId(url: string): string | null {
@@ -268,12 +345,6 @@ export class YouTubeResolver implements SourceResolver {
     }
   }
 
-  private videoRank(format: any): number {
-    const qualityLabel = String(format?.qualityLabel || '0').toLowerCase();
-    const qualityNumber = parseInt(qualityLabel.replace(/[^0-9]/g, ''), 10) || 0;
-    return qualityNumber * 1000 + (Number(format?.fps || 0) * 10) + Number(format?.bitrate || 0) / 1000;
-  }
-
   private toQnFromYouTubeQuality(qualityLabel: string, height: number): number {
     const fromLabel = parseInt(String(qualityLabel || '').replace(/[^0-9]/g, ''), 10) || 0;
     const px = Math.max(fromLabel, Number(height || 0) || 0);
@@ -286,14 +357,15 @@ export class YouTubeResolver implements SourceResolver {
     return 0;
   }
 
-  private selectPreferredVideoFormat(formats: any[], preferredQn: number, minAcceptableQn: number): any | undefined {
-    return [...formats]
-      .map((format) => ({ format, qn: this.toQnFromYouTubeQuality(String(format?.qualityLabel || ''), Number(format?.height || 0) || 0) }))
-      .filter((item) => item.qn <= preferredQn && item.qn >= minAcceptableQn)
-      .sort((a, b) => {
-        if (b.qn !== a.qn) return b.qn - a.qn;
-        return this.videoRank(b.format) - this.videoRank(a.format);
-      })[0]?.format;
+  private toHeightFromQn(qn: number): number {
+    const normalized = Number(qn || 0) || 0;
+    if (normalized >= 120) return 2160;
+    if (normalized >= 116) return 1440;
+    if (normalized >= 80) return 1080;
+    if (normalized >= 64) return 720;
+    if (normalized >= 32) return 480;
+    if (normalized >= 16) return 360;
+    return 0;
   }
 
   private host(url: string): string {
