@@ -13,7 +13,7 @@ describe('RuntimeConfigEngine', () => {
 
   beforeEach(() => {
     tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'runtime-config-'));
-    write(path.join(tempRoot, 'config.default.yaml'), `download:\n  partSizeBytes: 8\n  timeoutMs: 30000\n  retryCount: 3\n  retryBackoffMs: 5000\n  minVideoQn: 80\nplayurl:\n  timeoutMs: 5000\nlogging:\n  rotate:\n    maxFileSizeMb: 5\n    checkIntervalMs: 5000\n`);
+    write(path.join(tempRoot, 'config.default.yaml'), `download:\n  partSizeBytes: 8\n  timeoutMs: 30000\n  retryCount: 3\n  retryBackoffMs: 5000\n  preferVideoQuality: 1080p\nplayurl:\n  timeoutMs: 5000\nlogging:\n  rotate:\n    maxFileSizeMb: 5\n    checkIntervalMs: 5000\n`);
     write(path.join(tempRoot, 'config.youtube.yaml'), `download:\n  partSizeBytes: 32\n`);
     write(path.join(tempRoot, 'cookies', 'youtube.json'), `[{"name":"SID","value":"abc"}]`);
   });
@@ -56,7 +56,7 @@ describe('RuntimeConfigEngine', () => {
 
     write(
       path.join(tempRoot, 'config.default.yaml'),
-      `download:\n  partSizeBytes: 8\n  timeoutMs: 30000\n  retryCount: 3\n  retryBackoffMs: 5000\n  minVideoQn: 80\nplayurl:\n  timeoutMs: 5000\nlogging:\n  rotate:\n    maxFileSizeMb: 5\n    checkIntervalMs: 5000\nredis:\n  url: redis://127.0.0.1:6380\n`,
+      `download:\n  partSizeBytes: 8\n  timeoutMs: 30000\n  retryCount: 3\n  retryBackoffMs: 5000\n  preferVideoQuality: 1080p\nplayurl:\n  timeoutMs: 5000\nlogging:\n  rotate:\n    maxFileSizeMb: 5\n    checkIntervalMs: 5000\nredis:\n  url: redis://127.0.0.1:6380\n`,
     );
     expect(await engine.reloadNow('redis-change')).toBe(true);
 

@@ -3,6 +3,7 @@ import { Processor, Process, InjectQueue } from '@nestjs/bull';
 import { Job, Queue } from 'bull';
 import { FfmpegService } from '../ffmpeg/ffmpeg.service';
 import { JobHistoryService } from '../jobs/job-history.service';
+import { JobArchiveService } from '../jobs/job-archive.service';
 import * as fs from 'fs';
 import * as path from 'path';
 import resumeDownload, { ResumeDownloadResult } from '../utils/resume-download';
@@ -12,6 +13,7 @@ import axios from 'axios';
 import { MediaPlannerService } from '../source/media-planner.service';
 import { MediaMode, Platform, ResolvedSource } from '../source/source.types';
 import { SourceRegistryService } from '../source/source-registry.service';
+import { buildVideoQualityPolicy } from '../source/video-quality';
 import { RuntimeConfigService } from '../config/runtime-config.service';
 
 // data directory is configurable via `config.download.dataDir` (absolute or relative)
@@ -77,6 +79,7 @@ return 1
   constructor(
     private readonly ffmpeg: FfmpegService,
     private readonly history: JobHistoryService,
+    private readonly archive: JobArchiveService,
     private readonly runtimeConfig: RuntimeConfigService,
     private readonly sourceRegistry: SourceRegistryService,
     private readonly mediaPlanner: MediaPlannerService,
@@ -149,12 +152,20 @@ return 1
       if (cookies && !commonHeaders.Cookie) commonHeaders.Cookie = cookies;
       const play = this.toLegacyPlayShape(resolvedSource);
       this.logger.debug('Resolved source streams: ' + JSON.stringify(Object.keys(play?.data || {})));
-      const minQn = Number(this.runtimeConfig.getForSource(platform, 'download.minVideoQn') ?? process.env.DOWNLOAD_MIN_VIDEO_QN ?? 80);
+      const qualityPolicy = buildVideoQualityPolicy(
+        this.runtimeConfig.getForSource(platform, 'download.preferVideoQuality'),
+      );
       const resolvedQn = Number(resolvedSource?.qualityMeta?.qn ?? play?.data?.quality ?? 0);
-      if (resolvedQn > 0 && resolvedQn < minQn) {
-        throw new Error(`resolved quality qn=${resolvedQn} is below required Full HD qn=${minQn}`);
+      if (resolvedQn > 0 && resolvedQn < qualityPolicy.minAcceptableQn) {
+        throw new Error(
+          `resolved quality qn=${resolvedQn} is below accepted minimum ` +
+            `${qualityPolicy.minAcceptableQn} for prefer=${qualityPolicy.preferredLabel}`,
+        );
       }
-      this.logger.debug(`Job ${job.id}: resolved playurl quality qn=${resolvedQn} (required>=${minQn})`);
+      this.logger.debug(
+        `Job ${job.id}: resolved playurl quality qn=${resolvedQn} (prefer=${qualityPolicy.preferredLabel}, ` +
+          `accepted=${qualityPolicy.minAcceptableQn}-${qualityPolicy.preferredQn})`,
+      );
 
       // If caller provides title, always use it.
       // Otherwise fetch title from source, optionally translate to Vietnamese
@@ -196,12 +207,11 @@ return 1
       const retryBackoffMs = Number(this.runtimeConfig.getForSource(platform, 'download.retryBackoffMs') ?? 5000);
       const resumeEnabled = Boolean(this.runtimeConfig.getForSource(platform, 'download.resumeEnabled') ?? true);
 
-      const cancelFile = path.join(this['dataDir'], `${job.id}.cancel`);
-      const stopFile = path.join(this['dataDir'], `${job.id}.stop`);
       const stopKey = `job:stop:${job.id}`;
       const cancelKey = `job:cancel:${job.id}`;
       let stopRequested = false;
       let cancelRequested = false;
+      const abortRequested = () => stopRequested || cancelRequested;
       let _poll: any = null;
       let subClient: any = null;
       const redisClient: any = (this.downloadQueue && (this.downloadQueue as any).client) ? (this.downloadQueue as any).client : null;
@@ -236,7 +246,7 @@ return 1
       }
 
       if (play.data?.dash) {
-        const selectedDash = this.selectDashTracks(play.data.dash, minQn);
+        const selectedDash = this.selectDashTracks(play.data.dash, qualityPolicy.preferredQn, qualityPolicy.minAcceptableQn);
         const videoUrl = selectedDash.videoUrl;
         const audioUrl = selectedDash.audioUrl;
         if (!videoUrl || !audioUrl) throw new Error('dash urls missing');
@@ -264,16 +274,16 @@ return 1
           fs.writeFileSync(manifestPath, JSON.stringify(dashManifest, null, 2), 'utf8');
         } catch (e) {}
 
-        if (fs.existsSync(cancelFile) || cancelRequested) {
+        if (cancelRequested) {
           await this.history.appendEvent(job.id.toString(), { state: 'cancelled', progress: 0 });
           this.logger.log(`Job ${job.id} cancelled before download start`);
           return { cancelled: true };
         }
-        if (fs.existsSync(stopFile) || stopRequested) {
+        if (stopRequested) {
           await this.history.appendEvent(job.id.toString(), { state: 'stopped', progress: 0 });
           this.logger.log(`Job ${job.id} stopped before download start`);
           try { if (redisClient) await redisClient.del(stopKey); } catch (e) {}
-          try { if (fs.existsSync(stopFile)) fs.unlinkSync(stopFile); } catch (e) {}
+          // no local stop marker cleanup; Redis signal key is authoritative
           if (_poll) clearInterval(_poll);
           try { if (subClient) { if (typeof subClient.unsubscribe === 'function') { try { await subClient.unsubscribe(stopKey); } catch {} try { await subClient.unsubscribe(cancelKey); } catch {} } if (typeof subClient.disconnect === 'function') await subClient.disconnect(); if (typeof subClient.quit === 'function') await subClient.quit(); } } catch (e) {}
           return { stopped: true };
@@ -412,6 +422,7 @@ return 1
           for (const p of videoParts) {
             this.logger.debug(`Enqueue video part job=${job.id} part=${p.partIndex} expectedBytes=${p.expectedBytes}`);
             const j = await this.partsQueue!.add({ jobId: String(job.id), vid, platform, totalJobCount: totalPartJobs, segmentUrls: p.segmentUrls, partIndex: p.partIndex, expectedBytes: p.expectedBytes || 0, headers, role: 'video' } as any, { attempts: retryCount, backoff: retryBackoffMs });
+            await this.indexPartJob(redisClient, String(job.id), String(j.id));
             partJobs.push(j);
           }
 
@@ -420,6 +431,7 @@ return 1
             for (const p of finalAudioParts) {
               this.logger.debug(`Enqueue audio part job=${job.id} part=${p.partIndex} expectedBytes=${p.expectedBytes}`);
               const j = await this.partsQueue!.add({ jobId: String(job.id), vid, platform, totalJobCount: totalPartJobs, segmentUrls: p.segmentUrls, partIndex: p.partIndex, expectedBytes: p.expectedBytes || 0, headers, role: 'audio' } as any, { attempts: retryCount, backoff: retryBackoffMs });
+              await this.indexPartJob(redisClient, String(job.id), String(j.id));
               audioPartJobs.push(j);
             }
           }
@@ -436,16 +448,16 @@ return 1
             await this.reportByteProgress(job, 0, totalExpectedBytes, segmentedProgressMin, segmentedProgressMax);
           }
           while (remaining > 0) {
-            if (fs.existsSync(cancelFile) || cancelRequested) {
+            if (cancelRequested) {
               await this.history.appendEvent(job.id.toString(), { state: 'cancelled', progress: 0 });
               this.logger.log(`Job ${job.id} cancelled during segmented download`);
               return { cancelled: true };
             }
-            if (fs.existsSync(stopFile) || stopRequested) {
+            if (stopRequested) {
               await this.history.appendEvent(job.id.toString(), { state: 'stopped', progress: 0 });
               this.logger.log(`Job ${job.id} stopped during segmented download`);
               try { if (redisClient) await redisClient.del(stopKey); } catch (e) {}
-              try { if (fs.existsSync(stopFile)) fs.unlinkSync(stopFile); } catch (e) {}
+              // no local stop marker cleanup; Redis signal key is authoritative
               return { stopped: true };
             }
             remaining = 0;
@@ -525,8 +537,8 @@ return 1
                   audioUrl,
                   audioTmp,
                   commonHeaders,
-                  cancelFile,
-                  () => stopRequested || cancelRequested,
+                  abortRequested,
+                  undefined,
                   undefined,
                   downloadOptions,
                   retryCount,
@@ -622,6 +634,7 @@ return 1
                 { jobId: String(job.id), vid, totalJobCount: totalPartJobs, url: videoUrl, partIndex: p.partIndex, rangeStart: p.rangeStart, rangeEnd: p.rangeEnd, expectedBytes: p.expectedBytes, headers, role: 'video' } as any,
                 { attempts: retryCount, backoff: retryBackoffMs },
               );
+              await this.indexPartJob(redisClient, String(job.id), String(j.id));
               partJobs.push(j);
             }
             const audioPartJobs: Job[] = [];
@@ -645,6 +658,7 @@ return 1
                   { jobId: String(job.id), vid, totalJobCount: totalPartJobs, url: audioUrl, partIndex: p.partIndex, rangeStart: p.rangeStart, rangeEnd: p.rangeEnd, expectedBytes: p.expectedBytes, headers, role: 'audio' } as any,
                   { attempts: retryCount, backoff: retryBackoffMs },
                 );
+                await this.indexPartJob(redisClient, String(job.id), String(j.id));
                 audioPartJobs.push(j);
               }
             }
@@ -657,16 +671,16 @@ return 1
             const dashByteRangeProgressMax = 74;
             await this.reportByteProgress(job, initialDownloadedBytes, totalExpectedBytes, dashByteRangeProgressMin, dashByteRangeProgressMax);
             while (remaining > 0) {
-              if (fs.existsSync(cancelFile) || cancelRequested) {
+              if (cancelRequested) {
                 await this.history.appendEvent(job.id.toString(), { state: 'cancelled', progress: 0 });
                 this.logger.log(`Job ${job.id} cancelled during dash-byte-range download`);
                 return { cancelled: true };
               }
-              if (fs.existsSync(stopFile) || stopRequested) {
+              if (stopRequested) {
                 await this.history.appendEvent(job.id.toString(), { state: 'stopped', progress: 0 });
                 this.logger.log(`Job ${job.id} stopped during dash-byte-range download`);
                 try { if (redisClient) await redisClient.del(stopKey); } catch (e) {}
-                try { if (fs.existsSync(stopFile)) fs.unlinkSync(stopFile); } catch (e) {}
+                // no local stop marker cleanup; Redis signal key is authoritative
                 return { stopped: true };
               }
               remaining = 0;
@@ -725,8 +739,8 @@ return 1
                 audioUrl,
                 audioTmp,
                 commonHeaders,
-                cancelFile,
-                () => stopRequested || cancelRequested,
+                abortRequested,
+                undefined,
                 undefined,
                 downloadOptions,
                 retryCount,
@@ -814,7 +828,7 @@ return 1
               await this.history.appendEvent(job.id.toString(), { state: 'segmenting', progress: 35, manifestPath });
               const headers = { ...commonHeaders };
               const partJobs = [];
-              for (const p of parts) { this.logger.debug(`Enqueue byte-range part job=${job.id} part=${p.partIndex} range=${p.rangeStart}-${p.rangeEnd} expected=${p.expectedBytes}`); const j = await this.partsQueue!.add({ jobId: String(job.id), vid, platform, totalJobCount: parts.length, url: durlUrl, partIndex: p.partIndex, rangeStart: p.rangeStart, rangeEnd: p.rangeEnd, expectedBytes: p.expectedBytes, headers } as any, { attempts: retryCount, backoff: retryBackoffMs }); partJobs.push(j); }
+              for (const p of parts) { this.logger.debug(`Enqueue byte-range part job=${job.id} part=${p.partIndex} range=${p.rangeStart}-${p.rangeEnd} expected=${p.expectedBytes}`); const j = await this.partsQueue!.add({ jobId: String(job.id), vid, platform, totalJobCount: parts.length, url: durlUrl, partIndex: p.partIndex, rangeStart: p.rangeStart, rangeEnd: p.rangeEnd, expectedBytes: p.expectedBytes, headers } as any, { attempts: retryCount, backoff: retryBackoffMs }); await this.indexPartJob(redisClient, String(job.id), String(j.id)); partJobs.push(j); }
               const activeStallMs = Math.max(30000, Number(this.runtimeConfig.getForSource(platform, 'download.partActiveStallMs') ?? 180000));
               const pollMs = 5000;
               const lastProgress: Record<string, { value: number; ts: number; state: string; bytes: number }> = {};
@@ -823,16 +837,16 @@ return 1
               const durlProgressMax = 79;
               await this.reportByteProgress(job, 0, totalSize, durlProgressMin, durlProgressMax);
               while (remaining > 0) {
-                if (fs.existsSync(cancelFile) || cancelRequested) {
+                if (cancelRequested) {
                   await this.history.appendEvent(job.id.toString(), { state: 'cancelled', progress: 0 });
                   this.logger.log(`Job ${job.id} cancelled during durl-byte-range download`);
                   return { cancelled: true };
                 }
-                if (fs.existsSync(stopFile) || stopRequested) {
+                if (stopRequested) {
                   await this.history.appendEvent(job.id.toString(), { state: 'stopped', progress: 0 });
                   this.logger.log(`Job ${job.id} stopped during durl-byte-range download`);
                   try { if (redisClient) await redisClient.del(stopKey); } catch (e) {}
-                  try { if (fs.existsSync(stopFile)) fs.unlinkSync(stopFile); } catch (e) {}
+                  // no local stop marker cleanup; Redis signal key is authoritative
                   return { stopped: true };
                 }
                 remaining = 0;
@@ -892,7 +906,7 @@ return 1
         if (!didSegment) {
           const singlePermit = await this.acquireSingleDownloadPermit(job);
           try {
-          if (fs.existsSync(cancelFile) || cancelRequested) { await this.history.appendEvent(job.id.toString(), { state: 'cancelled', progress: 0 }); this.logger.log(`Job ${job.id} cancelled before download start`); return { cancelled: true }; }
+          if (cancelRequested) { await this.history.appendEvent(job.id.toString(), { state: 'cancelled', progress: 0 }); this.logger.log(`Job ${job.id} cancelled before download start`); return { cancelled: true }; }
           let dashSingleTotalSize = 0;
           try {
             const vh = await axios.head(videoUrl, { headers: commonHeaders, timeout: 5000 });
@@ -930,8 +944,8 @@ return 1
               videoUrl,
               videoTmp,
               commonHeaders,
-              cancelFile,
-              () => stopRequested || cancelRequested,
+              abortRequested,
+              undefined,
               onDashProgress,
               downloadOptions,
               retryCount,
@@ -953,8 +967,8 @@ return 1
                 audioUrl,
                 audioTmp,
                 commonHeaders,
-                cancelFile,
-                () => stopRequested || cancelRequested,
+                abortRequested,
+                undefined,
                 onDashProgress,
                 downloadOptions,
                 retryCount,
@@ -996,7 +1010,6 @@ return 1
             mediaFallbackReason: mediaPlan.fallbackReason || null,
           },
         });
-        try { if (fs.existsSync(cancelFile)) fs.unlinkSync(cancelFile); } catch (e) {}
         this.cleanupJobTempArtifacts(String(job.id), finalPath);
         this.logger.log(`Job ${job.id} finished in ${formatElapsedDuration(Date.now() - jobStartedAt)}, output: ${finalPath}`);
         return {
@@ -1012,13 +1025,16 @@ return 1
 
       // existing durl (single url / byte-range) flow remains unchanged
       if (play.data?.durl?.length) {
-        if (resolvedQn > 0 && resolvedQn < minQn) {
-          throw new Error(`durl quality qn=${resolvedQn} is below required Full HD qn=${minQn}`);
+        if (resolvedQn > 0 && resolvedQn < qualityPolicy.minAcceptableQn) {
+          throw new Error(
+            `durl quality qn=${resolvedQn} is below accepted minimum ` +
+              `${qualityPolicy.minAcceptableQn} for prefer=${qualityPolicy.preferredLabel}`,
+          );
         }
         const url = play.data.durl[0].url;
         const tempOutFile = path.join(this['dataDir'], `${vid}-${job.id}.mp4`);
         this.adoptResumeArtifacts(job, payload, vid, undefined, undefined, tempOutFile);
-        if (fs.existsSync(cancelFile)) { await this.history.appendEvent(job.id.toString(), { state: 'cancelled', progress: 0 }); this.logger.log(`Job ${job.id} cancelled before download start`); return { cancelled: true }; }
+        if (cancelRequested) { await this.history.appendEvent(job.id.toString(), { state: 'cancelled', progress: 0 }); this.logger.log(`Job ${job.id} cancelled before download start`); return { cancelled: true }; }
         await job.progress(30);
         await this.history.appendEvent(job.id.toString(), { state: 'downloading', progress: 30 });
 
@@ -1082,7 +1098,7 @@ return 1
             url,
             tempOutFile,
             commonHeaders,
-            cancelFile,
+            abortRequested,
             undefined,
             onProgress,
             downloadOptions,
@@ -1116,7 +1132,7 @@ return 1
           await this.history.appendEvent(job.id.toString(), { state: 'segmenting', progress: 35, manifestPath });
           const headers = { ...commonHeaders };
           const partJobs = [];
-          for (const p of parts) { this.logger.debug(`Enqueue byte-range part job=${job.id} part=${p.partIndex} range=${p.rangeStart}-${p.rangeEnd} expected=${p.expectedBytes}`); const j = await this.partsQueue!.add({ jobId: String(job.id), vid, platform, totalJobCount: parts.length, url, partIndex: p.partIndex, rangeStart: p.rangeStart, rangeEnd: p.rangeEnd, expectedBytes: p.expectedBytes, headers } as any, { attempts: retryCount, backoff: retryBackoffMs }); partJobs.push(j); }
+          for (const p of parts) { this.logger.debug(`Enqueue byte-range part job=${job.id} part=${p.partIndex} range=${p.rangeStart}-${p.rangeEnd} expected=${p.expectedBytes}`); const j = await this.partsQueue!.add({ jobId: String(job.id), vid, platform, totalJobCount: parts.length, url, partIndex: p.partIndex, rangeStart: p.rangeStart, rangeEnd: p.rangeEnd, expectedBytes: p.expectedBytes, headers } as any, { attempts: retryCount, backoff: retryBackoffMs }); await this.indexPartJob(redisClient, String(job.id), String(j.id)); partJobs.push(j); }
           const activeStallMs = Math.max(30000, Number(this.runtimeConfig.getForSource(platform, 'download.partActiveStallMs') ?? 180000));
           const pollMs = 5000;
           const lastProgress: Record<string, { value: number; ts: number; state: string; bytes: number }> = {};
@@ -1125,16 +1141,16 @@ return 1
           const durlProgressMax = 79;
           if (totalSize > 0) await this.reportByteProgress(job, 0, totalSize, durlProgressMin, durlProgressMax);
           while (remaining > 0) {
-            if (fs.existsSync(cancelFile) || cancelRequested) {
+            if (cancelRequested) {
               await this.history.appendEvent(job.id.toString(), { state: 'cancelled', progress: 0 });
               this.logger.log(`Job ${job.id} cancelled during durl-byte-range download`);
               return { cancelled: true };
             }
-            if (fs.existsSync(stopFile) || stopRequested) {
+            if (stopRequested) {
               await this.history.appendEvent(job.id.toString(), { state: 'stopped', progress: 0 });
               this.logger.log(`Job ${job.id} stopped during durl-byte-range download`);
               try { if (redisClient) await redisClient.del(stopKey); } catch (e) {}
-              try { if (fs.existsSync(stopFile)) fs.unlinkSync(stopFile); } catch (e) {}
+              // no local stop marker cleanup; Redis signal key is authoritative
               return { stopped: true };
             }
             remaining = 0;
@@ -1186,8 +1202,8 @@ return 1
           await job.progress(95);
         }
         await job.progress(100);
-        try { if (fs.existsSync(stopFile) || stopRequested) { await this.history.appendEvent(job.id.toString(), { state: 'stopped', progress: 0 }); this.logger.log(`Job ${job.id} stopped during download`); try { if (redisClient) await redisClient.del(stopKey); } catch (e) {} try { if (fs.existsSync(stopFile)) fs.unlinkSync(stopFile); } catch (e) {} if (_poll) clearInterval(_poll); return { stopped: true }; } } catch (e) {}
-        try { if (fs.existsSync(cancelFile)) { await this.history.appendEvent(job.id.toString(), { state: 'cancelled', progress: 0 }); this.logger.log(`Job ${job.id} cancelled during download`); return { cancelled: true }; } } catch (e) {}
+        try { if (stopRequested) { await this.history.appendEvent(job.id.toString(), { state: 'stopped', progress: 0 }); this.logger.log(`Job ${job.id} stopped during download`); try { if (redisClient) await redisClient.del(stopKey); } catch (e) {} if (_poll) clearInterval(_poll); return { stopped: true }; } } catch (e) {}
+        try { if (cancelRequested) { await this.history.appendEvent(job.id.toString(), { state: 'cancelled', progress: 0 }); this.logger.log(`Job ${job.id} cancelled during download`); return { cancelled: true }; } } catch (e) {}
         const preparedOutput = await this.applyMediaModeOutput(tempOutFile, manifestDir, String(job.id), mediaPlan.effective);
         const ext = mediaPlan.effective === 'audio' ? 'm4a' : 'mp4';
         const finalDir = path.join(this.resultDir, platform, safeTitle); try { if (!fs.existsSync(finalDir)) fs.mkdirSync(finalDir, { recursive: true }); } catch (e) {}
@@ -1204,7 +1220,7 @@ return 1
             mediaEffective: mediaPlan.effective,
             mediaFallbackReason: mediaPlan.fallbackReason || null,
           },
-        }); try { if (fs.existsSync(cancelFile)) fs.unlinkSync(cancelFile); } catch (e) {}
+        });
         this.cleanupJobTempArtifacts(String(job.id), finalPath);
         this.logger.log(`Job ${job.id} finished in ${formatElapsedDuration(Date.now() - jobStartedAt)}, output: ${finalPath}`);
         return {
@@ -1230,6 +1246,11 @@ return 1
       throw err;
     }
     finally {
+      try {
+        await this.archive.archiveMasterJob(String(job.id), { reason: 'worker-finally' });
+      } catch (e) {
+        // archival failures are non-fatal for execution path
+      }
       this.releaseMasterSlot();
     }
   }
@@ -1245,7 +1266,8 @@ return 1
         quality: Number(source.qualityMeta?.qn || 0) || 0,
         dash: hasDash
           ? {
-              video: [{ id: Number(source.qualityMeta?.qn || 80) || 80, baseUrl: dashPair?.videoUrl || videoOnly?.url }],
+              // Do not default to any fixed quality here; keep unknown quality as 0 so policy checks stay correct.
+              video: [{ id: Number(source.qualityMeta?.qn || 0) || 0, baseUrl: dashPair?.videoUrl || videoOnly?.url }],
               audio: [{ id: 30280, baseUrl: dashPair?.audioUrl || audioOnly?.url }],
             }
           : undefined,
@@ -1562,6 +1584,19 @@ return 1
     }
   }
 
+  private async indexPartJob(redisClient: any, jobId: string, partJobId: string | number): Promise<void> {
+    if (!redisClient || typeof redisClient.sadd !== 'function') return;
+    try {
+      const key = `job:parts:index:${jobId}`;
+      await redisClient.sadd(key, String(partJobId));
+      if (typeof redisClient.expire === 'function') {
+        await redisClient.expire(key, 7 * 24 * 60 * 60);
+      }
+    } catch (e) {
+      // ignore redis errors
+    }
+  }
+
   private async readAggregatedPartBytes(redisClient: any, jobId: string): Promise<{ totalExpectedBytes: number; totalDownloadedBytes: number }> {
     if (!redisClient || typeof redisClient.hgetall !== 'function') return { totalExpectedBytes: 0, totalDownloadedBytes: 0 };
     try {
@@ -1624,16 +1659,22 @@ return 1
     this.aggregateProgressLogState.set(key, { ts: now, downloaded });
   }
 
-  private selectDashTracks(dash: any, minQn: number): { videoUrl: string; audioUrl: string; videoQn: number } {
+  private selectDashTracks(dash: any, preferredQn: number, minAcceptableQn: number): { videoUrl: string; audioUrl: string; videoQn: number } {
     const videos: any[] = Array.isArray(dash?.video) ? dash.video : [];
     const audios: any[] = Array.isArray(dash?.audio) ? dash.audio : [];
     if (!videos.length || !audios.length) throw new Error('dash tracks missing');
 
     const sortedVideos = [...videos].sort((a, b) => Number(b?.id || 0) - Number(a?.id || 0));
-    const selectedVideo = sortedVideos.find((v) => Number(v?.id || 0) >= minQn);
+    const selectedVideo = sortedVideos.find((v) => {
+      const qn = Number(v?.id || 0);
+      return qn <= preferredQn && qn >= minAcceptableQn;
+    });
     if (!selectedVideo) {
       const offered = sortedVideos.map((v) => Number(v?.id || 0)).filter((n) => n > 0).join(',');
-      throw new Error(`no DASH video track satisfies Full HD (required qn>=${minQn}, offered=[${offered}])`);
+      throw new Error(
+        `no DASH video track satisfies preferred policy ` +
+          `(required qn ${minAcceptableQn}-${preferredQn}, offered=[${offered}])`,
+      );
     }
 
     const sortedAudios = [...audios].sort((a, b) => Number(b?.bandwidth || 0) - Number(a?.bandwidth || 0));
@@ -1861,7 +1902,7 @@ return 1
     url: string,
     dest: string,
     headers: Record<string, string>,
-    cancelFile: string,
+    cancelCheck: (() => boolean) | undefined,
     stopCheck: (() => boolean) | undefined,
     onProgress: ((delta: number) => void) | undefined,
     downloadOptions: any,
@@ -1884,7 +1925,7 @@ return 1
           url,
           dest,
           headers,
-          cancelFile,
+          cancelCheck,
           stopCheck,
           onProgress,
           false,

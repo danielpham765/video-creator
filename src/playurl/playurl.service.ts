@@ -1,6 +1,7 @@
 import { Injectable } from '@nestjs/common';
 import axios from 'axios';
 import { RuntimeConfigService } from '../config/runtime-config.service';
+import { buildVideoQualityPolicy } from '../source/video-quality';
 
 @Injectable()
 export class PlayurlService {
@@ -21,12 +22,11 @@ export class PlayurlService {
 
   async getPlayurl(bvid: string, cid: any, cookies?: string): Promise<any> {
     const base = String(this.runtimeConfig.getForSource('bilibili', 'playurl.baseUrl') || 'https://api.bilibili.com');
-    // Bilibili quality code:
-    // - 80: 1080p (Full HD)
-    // - 112/116/120/125/126/127: higher than 1080p depending on content/account
-    // Request a high target quality, then worker validates minimum acceptable quality.
-    const targetQn = Number(this.runtimeConfig.getForSource('bilibili', 'playurl.targetQn') ?? process.env.PLAYURL_TARGET_QN ?? 116);
-    const url = `${base.replace(/\/$/, '')}/x/player/playurl?bvid=${bvid}&cid=${cid}&qn=${targetQn}&fnval=16`;
+    // Requested qn comes directly from preferred quality policy.
+    const qualityPolicy = buildVideoQualityPolicy(
+      this.runtimeConfig.getForSource('bilibili', 'download.preferVideoQuality'),
+    );
+    const url = `${base.replace(/\/$/, '')}/x/player/playurl?bvid=${bvid}&cid=${cid}&qn=${qualityPolicy.preferredQn}&fnval=16`;
     const headers: any = { Referer: `https://www.bilibili.com/video/${bvid}` };
     if (cookies) headers.Cookie = cookies;
     const timeout = Number(this.runtimeConfig.getForSource('bilibili', 'playurl.timeoutMs') ?? 5000);

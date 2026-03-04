@@ -18,7 +18,7 @@ export class AppModule {
       };
     }
 
-    const imports: any[] = [AppConfigModule, DownloadModule];
+    const imports: any[] = [AppConfigModule];
     // Ensure Bull (Redis) root config is registered so API can enqueue jobs
     imports.push(
       BullModule.forRootAsync({
@@ -30,6 +30,7 @@ export class AppModule {
         inject: [ConfigService],
       }),
     );
+    imports.push(DownloadModule);
     return {
       module: AppModule,
       imports,

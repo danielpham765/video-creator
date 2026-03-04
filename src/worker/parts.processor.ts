@@ -112,15 +112,21 @@ export class PartsProcessor {
       this.logger.log(`Handling download job ${jobId} part ${partIndex}/${displayTotalJobCount} (role=${role || 'video'}, queueJobId=${job.id})`);
       // this.logger.debug(`part payload=${JSON.stringify(data)}`);
 
-      const cancelFile = path.join(this['dataDir'], `${jobId}.cancel`);
-      const stopFile = path.join(this['dataDir'], `${jobId}.stop`);
       const cancelKey = `job:cancel:${jobId}`;
       const stopKey = `job:stop:${jobId}`;
-      let shouldAbort = fs.existsSync(cancelFile) || fs.existsSync(stopFile);
+      let shouldAbort = false;
+      let signalPollTimer: NodeJS.Timeout | null = null;
       if (!shouldAbort && redisClientForSignal && typeof redisClientForSignal.get === 'function') {
         try {
           const [cancelSignal, stopSignal] = await Promise.all([redisClientForSignal.get(cancelKey), redisClientForSignal.get(stopKey)]);
           shouldAbort = Boolean(cancelSignal || stopSignal);
+          signalPollTimer = setInterval(async () => {
+            if (shouldAbort) return;
+            try {
+              const [c, s] = await Promise.all([redisClientForSignal.get(cancelKey), redisClientForSignal.get(stopKey)]);
+              if (c || s) shouldAbort = true;
+            } catch {}
+          }, 300);
         } catch (e) {
           // ignore redis signal read errors
         }
@@ -229,7 +235,7 @@ export class PartsProcessor {
                 if (!this.runtimeConfig.getForSource(platform, 'download.resumeEnabled')) {
                   try { if (fs.existsSync(segTmp)) fs.unlinkSync(segTmp); } catch (e) {}
                 }
-                await resumeDownload(segUrl, segTmp, reqHeaders, path.join(this['dataDir'], `${jobId}.cancel`), undefined, onProgress, false, {
+                await resumeDownload(segUrl, segTmp, reqHeaders, () => shouldAbort, undefined, onProgress, false, {
                   timeoutMs: Number(this.runtimeConfig.getForSource(platform, 'download.timeoutMs') ?? 30000),
                   proxy: String(this.runtimeConfig.getForSource(platform, 'proxy.http') || this.runtimeConfig.getForSource(platform, 'proxy.https') || '' ) || undefined,
                   logger: this.logger,
@@ -281,7 +287,7 @@ export class PartsProcessor {
           url!,
           partPath,
           reqHeaders,
-          cancelFile,
+          () => shouldAbort,
           undefined,
           onProgress,
           true,
@@ -327,6 +333,7 @@ export class PartsProcessor {
           expectedBytes,
         };
       } finally {
+        if (signalPollTimer) clearInterval(signalPollTimer);
         await this.releasePartOwnership(redisClientForSignal, partLockKey, partLockToken);
       }
     } finally {

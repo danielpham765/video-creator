@@ -1,12 +1,15 @@
 ## Video Downloader API - Developer Architecture
 
-Last updated: 2026-02-28
+Last updated: 2026-03-04
 
 ### High-level overview
 
 - Purpose: background-friendly multi-source downloader. API receives download requests, worker resolves playable URLs via platform handlers, downloads, merges/transcodes, and stores final files in `result/`.
-- Stack: NestJS + Bull + Redis + FFmpeg.
-- Persistence: Bull/Redis for queue state, filesystem for artifacts/history (`data/`, `logs/`).
+- Stack: NestJS + Bull + Redis + Postgres + FFmpeg.
+- Persistence:
+  - Bull/Redis for in-flight queue state.
+  - Postgres (`download_job_archive`) for terminal master-job archival.
+  - Filesystem for artifacts/history (`data/`, `logs/`).
 
 ### Runtime topology
 
@@ -53,10 +56,13 @@ Last updated: 2026-02-28
 - `GET /download/status/:id`
   - Returns job `state`, `progress`, `failedReason`, `result`, `history`.
   - Adds parts summary from Redis hash `job:parts:<id>`.
+  - Falls back to Postgres archive when Bull misses.
 - `POST /download/:id/resume`
   - Sends stop signal (`job:stop:<id>`), waits for `stopped`, then enqueues new job.
+  - Falls back to archived payload in Postgres when source job is not in Bull.
 - `POST /download/:id/cancel`
-  - Creates cancel marker and Redis cancel key (`job:cancel:<id>`), best-effort removes queued job.
+  - Sets Redis cancel key/channel (`job:cancel:<id>`), best-effort removes queued job.
+  - Does not create `/data/<id>.cancel` marker from API.
 - `POST /download/:id/merge-partial`
   - Partial merge helper for `durl-byte-range` manifests.
 
@@ -69,14 +75,18 @@ Last updated: 2026-02-28
   - key/value object
   - plain cookie string
 
-### Video quality policy (Full HD only)
+### Video quality policy
 
-- Worker enforces minimum video quality by Bilibili `qn` code before download.
+- Worker enforces preferred quality with lower fallback by source `qn` code.
 - Config:
-  - `download.minVideoQn` (default `80`) -> `80` means 1080p Full HD.
-  - `playurl.targetQn` (default `116`) -> requested target quality in playurl API.
-- If resolved quality is below `download.minVideoQn`, job fails immediately.
-- For DASH, worker selects the highest video track where `id >= minVideoQn`.
+  - `download.preferVideoQuality` (default `1080p`)
+  - Allowed: `2160p`, `1440p`, `1080p`, `720p`, `480p`, `360p`
+- Selection rule:
+  - pick preferred quality first
+  - fallback to lower quality if preferred is unavailable
+  - minimum fallback is `720p`, except when preferred is `480p` or `360p`
+- If resolved quality is below the accepted minimum, job fails immediately.
+- For DASH, worker selects the highest video track in accepted range `[minAcceptableQn, preferredQn]`.
 
 ### Title and output naming flow
 

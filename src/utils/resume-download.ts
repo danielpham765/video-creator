@@ -15,7 +15,7 @@ export async function resumeDownload(
   url: string,
   dest: string,
   headers?: Record<string, string>,
-  cancelFilePath?: string,
+  cancelFilePathOrCheck?: string | StopCheckFn,
   stopFileOrCheck?: string | StopCheckFn,
   onProgress?: ProgressCallback,
   computeMd5: boolean = false,
@@ -60,7 +60,7 @@ export async function resumeDownload(
     if (start > 0 && response.status === 200) {
     try { (options?.logger?.log ?? console.log)(`[download] Server ignored Range; restarting ${dest}`); } catch (e) {}
     try { fs.unlinkSync(dest); } catch (e) { }
-    return resumeDownload(url, dest, headers, cancelFilePath, stopFileOrCheck, onProgress, computeMd5, options);
+    return resumeDownload(url, dest, headers, cancelFilePathOrCheck, stopFileOrCheck, onProgress, computeMd5, options);
   }
 
   const contentLength = parseInt(response.headers['content-length'] || '0', 10) || 0;
@@ -96,11 +96,14 @@ export async function resumeDownload(
     const now = Date.now();
     // cooperative cancellation: if cancel file exists, abort the stream
     try {
-      if (cancelFilePath && fs.existsSync(cancelFilePath)) {
+      if (
+        (typeof cancelFilePathOrCheck === 'string' && cancelFilePathOrCheck && fs.existsSync(cancelFilePathOrCheck))
+        || (typeof cancelFilePathOrCheck === 'function' && cancelFilePathOrCheck())
+      ) {
         const err = new Error('download cancelled');
         response.data.destroy(err);
         try { writer.close(); } catch (e) { }
-        try { (options?.logger?.debug ?? console.debug)(`[download] cancelled via cancelFile=${cancelFilePath}`); } catch (e) {}
+        try { (options?.logger?.debug ?? console.debug)(`[download] cancelled via cancel-check for ${dest}`); } catch (e) {}
         return;
       }
       // support either a stop-file path or a stop-check function

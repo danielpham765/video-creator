@@ -1,7 +1,7 @@
 download:
   # Size per part when splitting (in megabytes). Default: 8 (ENV: PART_SIZE_BYTES)
   # Note: application should interpret this value as MB and convert to bytes.
-  partSizeBytes: 65
+  partSizeBytes: 64
   # Per-process cap for parallel strategies:
   # - dash-segmented
   # - durl-byte-range
@@ -22,7 +22,7 @@ download:
   # - durl single file
   # Set 0 to disable this limiter. (ENV: GLOBAL_SINGLE_MAX_CONCURRENT_DOWNLOADS)
   globalSingleMaxConcurrentDownloads: 5
-  # Minimum accepted Bilibili video quality code.
-  # 80 = 1080p (Full HD). Job fails if resolved quality is below this threshold.
-  # (ENV: DOWNLOAD_MIN_VIDEO_QN)
-  minVideoQn: 80
+  # Preferred video quality.
+  # Allowed: 2160p, 1440p, 1080p, 720p, 480p, 360p
+  # Fallback goes downward; minimum fallback is 720p unless preferred is 480p or 360p.
+  preferVideoQuality: 1080p

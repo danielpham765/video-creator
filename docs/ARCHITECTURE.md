@@ -1,16 +1,16 @@
 ## Video Creator API Architecture (AI Cache)
 
-Last updated: 2026-02-28
+Last updated: 2026-03-04
 Source of truth for Cursor, Codex, and Antigravity AI.
 
 ### 1) Purpose
 
-- Project: `video-creator` (NestJS + Bull + Redis + FFmpeg).
+- Project: `video-creator` (NestJS + Bull + Redis + Postgres + FFmpeg).
 - Goal: accept multi-platform video/page URLs (Bilibili, YouTube, generic), run background downloads, and write final media files under `result/`.
 - Persistence:
-  - Queue/job state in Bull + Redis.
+  - In-flight queue/runtime state in Bull + Redis.
+  - Terminal master-job archive in Postgres table `download_job_archive`.
   - Durable artifacts/history in filesystem (`data/`, `logs/`).
-  - No relational database.
 
 ### 2) Runtime Topology
 
@@ -37,7 +37,7 @@ Source of truth for Cursor, Codex, and Antigravity AI.
 1. Client calls `POST /download` with `CreateDownloadDto` (`url` required, `title` optional).
 2. [`DownloadController.startDownload()`](/Users/danielpham/sync-workspace/05_Stories/video-creator/src/download/download.controller.ts) accepts URL + optional `platform` and `media`, then enqueues a `downloads` job with normalized `vid`.
 3. Worker resolves streams via platform handlers in `src/source/`.
-   - Bilibili resolver still uses playurl APIs and enforces Full HD policy (`qn >= download.minVideoQn`, default `80`).
+   - Resolver/worker quality policy is driven by `download.preferVideoQuality` (default `1080p`) with downward fallback and source-specific stream matching.
 4. Worker selects strategy in this order:
    - `dash-segmented`
    - `dash-byte-range`
@@ -54,11 +54,14 @@ Source of truth for Cursor, Codex, and Antigravity AI.
   - Body: `{ url: string, title?: string, platform?: 'auto'|'bilibili'|'youtube'|'generic', media?: 'both'|'video'|'audio' }`
   - Response: `{ jobId }`
 - `GET /download/status/:id`
-  - Returns job state/progress/failure/result/history + parts summary (from Redis hash `job:parts:<id>` when present).
+  - Returns job state/progress/failure/result/history + parts summary from Redis when active.
+  - Falls back to Postgres archive when job is no longer in Bull/Redis.
 - `POST /download/:id/resume`
   - Sends stop signal and re-enqueues as a new job id.
+  - If source job is archived, loads archived payload and enqueues fresh Bull job.
 - `POST /download/:id/cancel`
-  - Sets cancel markers/signals and best-effort removes queued job.
+  - Sets Redis cancel signal (`job:cancel:<id>`) and best-effort removes queued job.
+  - No filesystem cancel marker is created by API.
 - `POST /download/:id/merge-partial`
   - Partial merge helper for byte-range manifests.
 
@@ -69,7 +72,6 @@ Source of truth for Cursor, Codex, and Antigravity AI.
   - Filesystem fallback: `data/<id>.stop`
 - Cancel:
   - Redis key/channel: `job:cancel:<id>`
-  - Filesystem marker: `data/<id>.cancel`
 - Part progress:
   - Redis hash: `job:parts:<id>`
 

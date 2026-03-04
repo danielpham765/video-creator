@@ -3,6 +3,7 @@ import axios from 'axios';
 import { PlayurlService } from '../../playurl/playurl.service';
 import { ResolveSourceInput, ResolvedSource, SourceResolver } from '../source.types';
 import { RuntimeConfigService } from '../../config/runtime-config.service';
+import { buildVideoQualityPolicy } from '../video-quality';
 
 @Injectable()
 export class BilibiliResolver implements SourceResolver {
@@ -60,14 +61,23 @@ export class BilibiliResolver implements SourceResolver {
   }
 
   private selectDashTracks(dash: any): { videoUrl: string; audioUrl: string } {
-    const minQn = Number(this.runtimeConfig.getForSource('bilibili', 'download.minVideoQn') ?? process.env.DOWNLOAD_MIN_VIDEO_QN ?? 80);
+    const policy = buildVideoQualityPolicy(
+      this.runtimeConfig.getForSource('bilibili', 'download.preferVideoQuality'),
+    );
     const videos = Array.isArray(dash?.video) ? dash.video : [];
     const audios = Array.isArray(dash?.audio) ? dash.audio : [];
 
-    const sortedVideos = videos
-      .filter((v: any) => Number(v?.id || 0) >= minQn)
-      .sort((a: any, b: any) => Number(b?.id || 0) - Number(a?.id || 0));
-    const selectedVideo = sortedVideos[0] || videos.sort((a: any, b: any) => Number(b?.id || 0) - Number(a?.id || 0))[0];
+    const sortedVideos = [...videos].sort((a: any, b: any) => Number(b?.id || 0) - Number(a?.id || 0));
+    const selectedVideo = sortedVideos.find((v: any) => {
+      const qn = Number(v?.id || 0);
+      return qn <= policy.preferredQn && qn >= policy.minAcceptableQn;
+    });
+    if (!selectedVideo) {
+      const offered = sortedVideos.map((v: any) => Number(v?.id || 0)).filter((n: number) => n > 0).join(',');
+      throw new Error(
+        `no DASH video track matches prefer=${policy.preferredLabel} (required qn ${policy.minAcceptableQn}-${policy.preferredQn}, offered=[${offered}])`,
+      );
+    }
     const selectedAudio = audios.sort((a: any, b: any) => Number(b?.id || 0) - Number(a?.id || 0))[0];
 
     const videoUrl = String(selectedVideo?.baseUrl || selectedVideo?.base_url || '').trim();

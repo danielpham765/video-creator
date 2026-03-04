@@ -6,6 +6,7 @@ import { CreateDownloadDto } from './dto/create-download.dto';
 import { ApiBody, ApiOperation, ApiParam } from '@nestjs/swagger';
 import { downloadSwagger } from './download.swagger';
 import { JobHistoryService } from '../jobs/job-history.service';
+import { JobArchiveService } from '../jobs/job-archive.service';
 import { FfmpegService } from '../ffmpeg/ffmpeg.service';
 import { RuntimeConfigService } from '../config/runtime-config.service';
 import { SourceRegistryService } from '../source/source-registry.service';
@@ -21,6 +22,7 @@ export class DownloadController {
     @InjectQueue('downloads') private readonly downloadQueue: Queue,
     @InjectQueue('download-parts') private readonly partsQueue: Queue,
     private readonly history: JobHistoryService,
+    private readonly archive: JobArchiveService,
     private readonly ffmpeg: FfmpegService,
     private readonly runtimeConfig: RuntimeConfigService,
     private readonly sourceRegistry: SourceRegistryService,
@@ -62,7 +64,20 @@ export class DownloadController {
   @ApiParam(downloadSwagger.get.getStatus.idParam)
   async getStatus(@Param('id') id: string) {
     const job = await this.downloadQueue.getJob(id as any);
-    if (!job) return { id, state: 'not-found' };
+    if (!job) {
+      const archived = await this.archive.getArchivedJob(id);
+      if (!archived) return { id, state: 'not-found' };
+      return {
+        id,
+        state: archived?.masterStatus?.state || archived?.terminalState || 'finished',
+        progress: Number(archived?.masterStatus?.progress || 100) || 100,
+        failedReason: archived?.masterStatus?.failedReason || null,
+        result: archived?.masterStatus?.result || null,
+        history: Array.isArray(archived?.history) ? archived.history : [],
+        parts: archived?.partsProgressRaw || null,
+        archived: true,
+      };
+    }
     const state = await job.getState();
     const progress = await job.progress();
     const failedReason = job.failedReason || null;
@@ -112,14 +127,16 @@ export class DownloadController {
   @ApiOperation(downloadSwagger.post.resume.operation)
   @ApiParam(downloadSwagger.post.resume.idParam)
   async resume(@Param('id') id: string) {
-    const job = await this.downloadQueue.getJob(id as any);
-    if (!job) throw new NotFoundException('job not found');
-    const data = job.data || {};
+    let job = await this.downloadQueue.getJob(id as any);
+    let data: any = job?.data || null;
+    if (!data) {
+      const archived = await this.archive.getArchivedJob(id);
+      data = archived?.masterStatus?.data || null;
+    }
+    if (!data) throw new NotFoundException('job not found');
     const vid = data.vid;
     if (!vid) throw new NotFoundException('vid missing from job data');
 
-    const cfgDataDir = String(this.runtimeConfig.getGlobal('download.dataDir') || path.join(process.cwd(), 'data'));
-    const DATA_DIR = path.isAbsolute(cfgDataDir) ? cfgDataDir : path.resolve(process.cwd(), cfgDataDir);
     const stopKey = `job:stop:${id}`;
     const cancelKey = `job:cancel:${id}`;
 
@@ -131,9 +148,7 @@ export class DownloadController {
         await client.set(stopKey, String(Date.now()), 'EX', 60);
       }
     } catch (e) {
-      // ignore redis errors and fall back to filesystem marker
-      try { if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true }); } catch (e) { }
-      try { fs.writeFileSync(path.join(DATA_DIR, `${id}.stop`), String(Date.now())); } catch (e) { }
+      // ignore redis errors; cancellation falls back to queue-level semantics
     }
     await this.history.appendEvent(id, { state: 'stop-requested', progress: 0 });
     await this.history.appendEvent(id, { state: 'cancel-requested', progress: 0 });
@@ -149,12 +164,6 @@ export class DownloadController {
       }
     } catch (e) {
       // ignore redis errors
-    }
-    try {
-      if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
-      fs.writeFileSync(path.join(DATA_DIR, `${id}.cancel`), String(Date.now()));
-    } catch (e) {
-      // ignore fs errors
     }
 
     // best-effort: drop queued part jobs of old master so migrated job can proceed cleanly
@@ -192,7 +201,7 @@ export class DownloadController {
       const client: any = (this.downloadQueue as any).client;
       if (client && typeof client.del === 'function') await client.del(stopKey);
     } catch (e) {
-      try { const f = path.join(DATA_DIR, `${id}.stop`); if (fs.existsSync(f)) fs.unlinkSync(f); } catch (e) { }
+      // ignore redis cleanup errors
     }
 
     // Requeue as a fresh job id so Bull always creates executable work.
@@ -247,16 +256,6 @@ export class DownloadController {
   @ApiParam(downloadSwagger.post.cancel.idParam)
   async cancel(@Param('id') id: string) {
     const job = await this.downloadQueue.getJob(id as any);
-    const cfgDataDir = String(this.runtimeConfig.getGlobal('download.dataDir') || path.join(process.cwd(), 'data'));
-    const DATA_DIR = path.isAbsolute(cfgDataDir) ? cfgDataDir : path.resolve(process.cwd(), cfgDataDir);
-    const cancelFile = path.join(DATA_DIR, `${id}.cancel`);
-    try {
-      // create cancel marker for worker to cooperatively stop
-      try { if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true }); } catch (e) { }
-      fs.writeFileSync(cancelFile, String(Date.now()));
-    } catch (e) {
-      // ignore
-    }
 
     // also set Redis cancellation key so remote workers see it
     try {
@@ -272,6 +271,23 @@ export class DownloadController {
       // ignore redis errors
     }
 
+    let state = '';
+    try {
+      if (job) state = await job.getState();
+    } catch (e) {
+      state = '';
+    }
+
+    try { await this.history.appendEvent(id, { state: 'cancelled', progress: 0 }); } catch (e) { }
+    if (state === 'waiting' || state === 'delayed' || state === 'paused') {
+      try {
+        await this.archive.archiveMasterJob(id, { reason: 'cancel-api', forceTerminalState: 'cancelled' });
+        return { status: 'cancelled', id };
+      } catch (e) {
+        // keep redis data when archive fails
+      }
+    }
+
     if (job) {
       try {
         await job.remove();
@@ -279,9 +295,14 @@ export class DownloadController {
         // could be active — worker will check cancel marker
       }
     }
-
-    try { await this.history.appendEvent(id, { state: 'cancelled', progress: 0 }); } catch (e) { }
     return { status: 'cancelled', id };
+  }
+
+  @Post('admin/archive/sweep')
+  async adminArchiveSweep(@Body() payload?: { limit?: number; dryRun?: boolean }) {
+    const limit = Math.max(1, Number(payload?.limit || 50));
+    const dryRun = Boolean(payload?.dryRun);
+    return this.archive.sweepTerminalJobs(limit, dryRun, 'admin');
   }
 
   @Post(':id/merge-partial')

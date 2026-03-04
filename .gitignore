@@ -12,7 +12,7 @@ pnpm-lock.yaml
 
 # Local runtime data and job outputs
 /data
-/result
+/video-result
 logs
 *.log
 
@@ -36,3 +36,6 @@ package-lock.json
 .pnpm-store/
 .pnpm-debug.log
 .pnpm/
+
+# Transient YouTube player script artifacts
+*-player-script.js

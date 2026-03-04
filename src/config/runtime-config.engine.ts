@@ -2,6 +2,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import * as yaml from 'js-yaml';
 import { ConcretePlatform } from '../source/source.types';
+import { normalizeVideoQualityLabel } from '../source/video-quality';
 import { RuntimeConfigListener, RuntimeConfigSnapshot, RuntimeReloadStatus } from './runtime-config.types';
 
 const KNOWN_SOURCES: ConcretePlatform[] = ['bilibili', 'youtube', 'generic'];
@@ -317,7 +318,7 @@ export class RuntimeConfigEngine {
     this.assertPositiveInt(snapshot.globalDefault, 'download.timeoutMs');
     this.assertNonNegativeInt(snapshot.globalDefault, 'download.retryCount');
     this.assertNonNegativeInt(snapshot.globalDefault, 'download.retryBackoffMs');
-    this.assertNonNegativeInt(snapshot.globalDefault, 'download.minVideoQn');
+    this.assertVideoQuality(snapshot.globalDefault, 'download.preferVideoQuality');
     this.assertPositiveInt(snapshot.globalDefault, 'playurl.timeoutMs');
     this.assertPositiveInt(snapshot.globalDefault, 'logging.rotate.maxFileSizeMb');
     this.assertPositiveInt(snapshot.globalDefault, 'logging.rotate.checkIntervalMs');
@@ -327,7 +328,7 @@ export class RuntimeConfigEngine {
       this.assertPositiveInt(cfg, 'download.timeoutMs', source);
       this.assertNonNegativeInt(cfg, 'download.retryCount', source);
       this.assertNonNegativeInt(cfg, 'download.retryBackoffMs', source);
-      this.assertNonNegativeInt(cfg, 'download.minVideoQn', source);
+      this.assertVideoQuality(cfg, 'download.preferVideoQuality', source);
       this.assertPositiveInt(cfg, 'playurl.timeoutMs', source);
       this.assertPositiveInt(cfg, 'logging.rotate.maxFileSizeMb', source);
       this.assertPositiveInt(cfg, 'logging.rotate.checkIntervalMs', source);
@@ -362,6 +363,16 @@ export class RuntimeConfigEngine {
       const hint = source ? ` for source ${source}` : '';
       throw new Error(`invalid ${pathExpr}${hint}: expected non-negative number, got ${String(value)}`);
     }
+  }
+
+  private assertVideoQuality(obj: Record<string, any>, pathExpr: string, source?: string): void {
+    const value = this.deepGet(obj, pathExpr);
+    if (value === undefined || value === null || value === '') return;
+    if (normalizeVideoQualityLabel(value)) return;
+    const hint = source ? ` for source ${source}` : '';
+    throw new Error(
+      `invalid ${pathExpr}${hint}: expected one of 2160p, 1440p, 1080p, 720p, 480p, 360p; got ${String(value)}`,
+    );
   }
 
   private readYamlFile(filePath: string): Record<string, any> {

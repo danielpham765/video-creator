@@ -1,4 +1,16 @@
 services:
+  postgres:
+    image: postgres:16
+    restart: unless-stopped
+    environment:
+      - POSTGRES_DB=video_creator
+      - POSTGRES_USER=postgres
+      - POSTGRES_PASSWORD=postgres
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+
   redis:
     image: redis:7
     restart: unless-stopped
@@ -16,6 +28,7 @@ services:
     ports:
       - "3000:3000"
     depends_on:
+      - postgres
       - redis
     volumes:
       - ./:/usr/src/app:cached
@@ -28,6 +41,7 @@ services:
       target: dev
     command: pnpm run start:dev
     depends_on:
+      - postgres
       - redis
     environment:
       - NODE_ENV=development
@@ -39,4 +53,5 @@ services:
       - /usr/src/app/node_modules
 
 volumes:
+  postgres-data: {}
   redis-data: {}

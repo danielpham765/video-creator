@@ -17,6 +17,21 @@ redis:
   # ENV: REDIS_PASSWORD
   password: ""
 
+database:
+  # Database client for archive persistence (ENV: DATABASE_CLIENT)
+  # Allowed: postgres
+  client: postgres
+  # ENV: DATABASE_HOST
+  host: postgres
+  # ENV: DATABASE_PORT
+  port: 5432
+  # ENV: DATABASE_USER
+  user: postgres
+  # ENV: DATABASE_PASSWORD
+  password: postgres
+  # ENV: DATABASE_DB
+  db: video_creator
+
 worker:
   # ENV: WORKER_CONCURRENCY
   concurrency: 2
@@ -65,16 +80,13 @@ download:
   retryCount: 3
   # Toggle resumable downloads on/off (ENV: RESUME_DOWNLOAD_ENABLED)
   resumeEnabled: true
-  # Minimum accepted Bilibili video quality code.
-  # 80 = 1080p (Full HD). Job fails if resolved quality is below this threshold.
-  # (ENV: DOWNLOAD_MIN_VIDEO_QN)
-  minVideoQn: 80
-
-playurl:
-  # Target quality code requested from Bilibili playurl API.
-  # 116 requests high quality; final accepted quality is still validated by download.minVideoQn.
-  # (ENV: PLAYURL_TARGET_QN)
-  targetQn: 116
+  # Preferred video quality across all sources.
+  # Allowed: 2160p, 1440p, 1080p, 720p, 480p, 360p
+  # Selection policy:
+  # - Try preferred quality first
+  # - If unavailable, fallback to lower quality
+  # - Minimum fallback is 720p, except when preferred is 480p or 360p
+  preferVideoQuality: 1080p
 
 ffmpeg:
   # Path to ffmpeg binary or package-provided executable (ENV: FFMPEG_PATH)
@@ -129,6 +141,16 @@ logging:
 app:
   # Interval (ms) for Bull stalled-check housekeeping (ENV: BULL_STALLED_CHECK_INTERVAL_MS)
   bullStalledCheckIntervalMs: 30000
+
+archive:
+  # Enable terminal-job archival to Postgres (ENV: ARCHIVE_ENABLED)
+  enabled: true
+  # Run a terminal-job sweep shortly after startup (ENV: ARCHIVE_SWEEP_ON_STARTUP)
+  sweepOnStartup: true
+  # Run periodic terminal-job sweeps in seconds (ENV: ARCHIVE_SWEEP_INTERVAL_SEC)
+  sweepIntervalSec: 60
+  # Max number of master jobs to sweep per pass (ENV: ARCHIVE_BATCH_SIZE)
+  batchSize: 50
 
 # Notes:
 # - To override any value, set the corresponding environment variable shown in the
