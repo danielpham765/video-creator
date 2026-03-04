@@ -145,16 +145,18 @@ app:
 archive:
   # Enable terminal-job archival to Postgres (ENV: ARCHIVE_ENABLED)
   enabled: true
+  # Optional explicit run id for archive key namespace.
+  # Default: auto-generated/shared via Redis key job:archive:run-id (ENV: ARCHIVE_RUN_ID)
+  runId: ""
   # Run a terminal-job sweep shortly after startup (ENV: ARCHIVE_SWEEP_ON_STARTUP)
   sweepOnStartup: true
   # Run periodic terminal-job sweeps in seconds (ENV: ARCHIVE_SWEEP_INTERVAL_SEC)
   sweepIntervalSec: 60
   # Max number of master jobs to sweep per pass (ENV: ARCHIVE_BATCH_SIZE)
   batchSize: 50
-
-# Notes:
-# - To override any value, set the corresponding environment variable shown in the
-#   inline comments (e.g. `export REDIS_URL=redis://user:pass@host:6379`).
-# - This file is intended for humans and documentation; runtime configuration
-#   can be loaded into the application (example: using a ConfigService) which
-#   reads environment variables or this YAML as desired.
+  # Distributed lock TTL for per-master archive execution in milliseconds
+  # (ENV: ARCHIVE_JOB_LOCK_MS)
+  jobLockMs: 120000
+  # Distributed lock TTL for sweep leader election in milliseconds
+  # (ENV: ARCHIVE_SWEEP_LOCK_MS)
+  sweepLockMs: 55000

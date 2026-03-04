@@ -4,7 +4,6 @@ import { AppConfigModule } from '../config/config.module';
 import { DbModule } from '../db/db.module';
 import { JobHistoryService } from './job-history.service';
 import { JobArchiveRepository } from './job-archive.repository';
-import { JobArchiveService } from './job-archive.service';
 
 @Module({
   imports: [
@@ -12,7 +11,7 @@ import { JobArchiveService } from './job-archive.service';
     DbModule,
     BullModule.registerQueue({ name: 'downloads' }, { name: 'download-parts' }),
   ],
-  providers: [JobHistoryService, JobArchiveRepository, JobArchiveService],
-  exports: [JobHistoryService, JobArchiveService],
+  providers: [JobHistoryService, JobArchiveRepository],
+  exports: [JobHistoryService, JobArchiveRepository],
 })
 export class JobsModule {}

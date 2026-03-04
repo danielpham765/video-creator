@@ -2,6 +2,8 @@ import { Injectable } from '@nestjs/common';
 import { PostgresService } from '../db/postgres.service';
 
 export interface ArchivedJobRecord {
+  archiveKey: string;
+  runId: string;
   jobId: string;
   terminalState: 'finished' | 'failed' | 'cancelled';
   masterRaw: Record<string, any>;
@@ -25,6 +27,8 @@ export class JobArchiveRepository {
     await this.postgres.query(
       `
       INSERT INTO download_job_archive (
+        archive_key,
+        run_id,
         job_id,
         terminal_state,
         master_raw,
@@ -37,9 +41,11 @@ export class JobArchiveRepository {
         archived_at,
         updated_at
       )
-      VALUES ($1,$2,$3::jsonb,$4::jsonb,$5::jsonb,$6::jsonb,$7::jsonb,$8::jsonb,$9::jsonb,NOW(),NOW())
-      ON CONFLICT (job_id)
+      VALUES ($1,$2,$3,$4,$5::jsonb,$6::jsonb,$7::jsonb,$8::jsonb,$9::jsonb,$10::jsonb,$11::jsonb,NOW(),NOW())
+      ON CONFLICT (archive_key)
       DO UPDATE SET
+        run_id = EXCLUDED.run_id,
+        job_id = EXCLUDED.job_id,
         terminal_state = EXCLUDED.terminal_state,
         master_raw = EXCLUDED.master_raw,
         master_status = EXCLUDED.master_status,
@@ -51,6 +57,8 @@ export class JobArchiveRepository {
         updated_at = NOW()
       `,
       [
+        record.archiveKey,
+        record.runId,
         record.jobId,
         record.terminalState,
         JSON.stringify(record.masterRaw || {}),
@@ -66,13 +74,17 @@ export class JobArchiveRepository {
 
   async getByJobId(jobId: string): Promise<ArchivedJobRecord | null> {
     const { rows } = await this.postgres.query<any>(
-      `SELECT job_id, terminal_state, master_raw, master_status, history, parts_progress_raw, part_jobs_raw, part_jobs_summary, redis_keys_archived
-       FROM download_job_archive WHERE job_id = $1 LIMIT 1`,
+      `SELECT archive_key, run_id, job_id, terminal_state, master_raw, master_status, history, parts_progress_raw, part_jobs_raw, part_jobs_summary, redis_keys_archived
+       FROM download_job_archive WHERE job_id = $1
+       ORDER BY updated_at DESC
+       LIMIT 1`,
       [jobId],
     );
     const row = rows[0];
     if (!row) return null;
     return {
+      archiveKey: String(row.archive_key || ''),
+      runId: String(row.run_id || 'legacy'),
       jobId: String(row.job_id),
       terminalState: row.terminal_state,
       masterRaw: row.master_raw || {},

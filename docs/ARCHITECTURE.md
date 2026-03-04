@@ -9,7 +9,7 @@ Source of truth for Cursor, Codex, and Antigravity AI.
 - Goal: accept multi-platform video/page URLs (Bilibili, YouTube, generic), run background downloads, and write final media files under `result/`.
 - Persistence:
   - In-flight queue/runtime state in Bull + Redis.
-  - Terminal master-job archive in Postgres table `download_job_archive`.
+  - Terminal master-job archive in Postgres table `download_job_archive` (append-safe with `archive_key = <run_id>:<job_id>`).
   - Durable artifacts/history in filesystem (`data/`, `logs/`).
 
 ### 2) Runtime Topology
@@ -55,10 +55,10 @@ Source of truth for Cursor, Codex, and Antigravity AI.
   - Response: `{ jobId }`
 - `GET /download/status/:id`
   - Returns job state/progress/failure/result/history + parts summary from Redis when active.
-  - Falls back to Postgres archive when job is no longer in Bull/Redis.
+  - Falls back to latest Postgres archive row by `job_id` when job is no longer in Bull/Redis.
 - `POST /download/:id/resume`
   - Sends stop signal and re-enqueues as a new job id.
-  - If source job is archived, loads archived payload and enqueues fresh Bull job.
+  - If source job is archived, loads latest archived payload by `job_id` and enqueues fresh Bull job.
 - `POST /download/:id/cancel`
   - Sets Redis cancel signal (`job:cancel:<id>`) and best-effort removes queued job.
   - No filesystem cancel marker is created by API.
@@ -69,7 +69,6 @@ Source of truth for Cursor, Codex, and Antigravity AI.
 
 - Stop:
   - Redis key/channel: `job:stop:<id>`
-  - Filesystem fallback: `data/<id>.stop`
 - Cancel:
   - Redis key/channel: `job:cancel:<id>`
 - Part progress:
@@ -95,7 +94,6 @@ Source of truth for Cursor, Codex, and Antigravity AI.
 
 - `result/`
   - `<platform>/<safeTitle>/<vid>-<jobId>.<ext>`
-  - `<jobId>.cancel`, `<jobId>.stop`
   - `<jobId>/manifest.json`
   - `<jobId>/parts/part-<i>.bin`, `audio-part-<i>.bin`
   - `jobs/<jobId>.json`
@@ -128,6 +126,7 @@ Source of truth for Cursor, Codex, and Antigravity AI.
   - `redis.*`
   - `worker.*`
   - `download.*`
+  - `archive.*`
   - `ffmpeg.*`
   - `proxy.*`
   - `logging.*`
@@ -138,3 +137,4 @@ Source of truth for Cursor, Codex, and Antigravity AI.
 - Final file naming stays `<vid>-<jobId>.<ext>` inside normalized title folder.
 - Cookies are read from `config/cookies/<source>.json` by worker.
 - `GET /download/status/:id` is canonical status endpoint.
+- `job_id` can be reused after Redis reset; archive identity is `archive_key` and lookup-by-id uses newest row.

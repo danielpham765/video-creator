@@ -8,7 +8,7 @@ Last updated: 2026-03-04
 - Stack: NestJS + Bull + Redis + Postgres + FFmpeg.
 - Persistence:
   - Bull/Redis for in-flight queue state.
-  - Postgres (`download_job_archive`) for terminal master-job archival.
+  - Postgres (`download_job_archive`) for terminal master-job archival (append-safe via `archive_key = <run_id>:<job_id>`).
   - Filesystem for artifacts/history (`data/`, `logs/`).
 
 ### Runtime topology
@@ -56,10 +56,10 @@ Last updated: 2026-03-04
 - `GET /download/status/:id`
   - Returns job `state`, `progress`, `failedReason`, `result`, `history`.
   - Adds parts summary from Redis hash `job:parts:<id>`.
-  - Falls back to Postgres archive when Bull misses.
+  - Falls back to latest Postgres archive row by `job_id` when Bull misses.
 - `POST /download/:id/resume`
   - Sends stop signal (`job:stop:<id>`), waits for `stopped`, then enqueues new job.
-  - Falls back to archived payload in Postgres when source job is not in Bull.
+  - Falls back to latest archived payload by `job_id` in Postgres when source job is not in Bull.
 - `POST /download/:id/cancel`
   - Sets Redis cancel key/channel (`job:cancel:<id>`), best-effort removes queued job.
   - Does not create `/data/<id>.cancel` marker from API.
@@ -224,9 +224,9 @@ Selection logic is in `src/worker/worker.processor.ts` and follows this order:
 ### Stop/cancel behavior
 
 - Stop:
-  - Redis key/channel `job:stop:<id>` + optional file fallback `data/<id>.stop`.
+  - Redis key/channel `job:stop:<id>`.
 - Cancel:
-  - Redis key/channel `job:cancel:<id>` + marker `data/<id>.cancel`.
+  - Redis key/channel `job:cancel:<id>`.
 - Worker and `resumeDownload()` check these signals cooperatively.
 
 ### Logging architecture
@@ -280,7 +280,6 @@ Logger: `FileLoggerService` (used as Nest logger in `main.ts`).
   - `bilibili/<safeTitle>/<bvid>-<jobId>.mp4`
   - `<jobId>/manifest.json`
   - `<jobId>/parts/part-<i>.bin`, `audio-part-<i>.bin`
-  - `<jobId>.cancel`, `<jobId>.stop`
   - `jobs/<jobId>.json`
 - `logs/`
   - `api/app.*.log`
@@ -296,3 +295,9 @@ Logger: `FileLoggerService` (used as Nest logger in `main.ts`).
   - `docker compose up --build -d api`
 - Scale workers:
   - `docker compose up -d --no-deps --scale worker=4 worker`
+
+### Archive identity note
+
+- Bull `job_id` is Redis-lifecycle scoped and can reset after Redis cleanup/restart.
+- Archive rows are uniquely keyed by `archive_key = <run_id>:<job_id>`.
+- Id-only API lookup (`/download/status/:id`, `/download/:id/resume`) uses the newest archived row for that `job_id`.

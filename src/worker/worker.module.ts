@@ -5,6 +5,7 @@ import { PartsProcessor } from './parts.processor';
 import { PlayurlModule } from '../playurl/playurl.module';
 import { FfmpegModule } from '../ffmpeg/ffmpeg.module';
 import { JobsModule } from '../jobs/jobs.module';
+import { JobArchiveService } from '../jobs/job-archive.service';
 import { AppConfigModule } from '../config/config.module';
 import { ConfigService } from '@nestjs/config';
 import { SourceModule } from '../source/source.module';
@@ -26,7 +27,7 @@ import { SourceModule } from '../source/source.module';
     BullModule.registerQueue({ name: 'downloads' }, { name: 'download-parts' }),
     JobsModule,
   ],
-  providers: [WorkerProcessor, PartsProcessor],
+  providers: [WorkerProcessor, PartsProcessor, JobArchiveService],
   exports: [],
 })
 export class WorkerModule {}

@@ -6,7 +6,7 @@ import { CreateDownloadDto } from './dto/create-download.dto';
 import { ApiBody, ApiOperation, ApiParam } from '@nestjs/swagger';
 import { downloadSwagger } from './download.swagger';
 import { JobHistoryService } from '../jobs/job-history.service';
-import { JobArchiveService } from '../jobs/job-archive.service';
+import { JobArchiveRepository } from '../jobs/job-archive.repository';
 import { FfmpegService } from '../ffmpeg/ffmpeg.service';
 import { RuntimeConfigService } from '../config/runtime-config.service';
 import { SourceRegistryService } from '../source/source-registry.service';
@@ -22,7 +22,7 @@ export class DownloadController {
     @InjectQueue('downloads') private readonly downloadQueue: Queue,
     @InjectQueue('download-parts') private readonly partsQueue: Queue,
     private readonly history: JobHistoryService,
-    private readonly archive: JobArchiveService,
+    private readonly archiveRepo: JobArchiveRepository,
     private readonly ffmpeg: FfmpegService,
     private readonly runtimeConfig: RuntimeConfigService,
     private readonly sourceRegistry: SourceRegistryService,
@@ -65,7 +65,12 @@ export class DownloadController {
   async getStatus(@Param('id') id: string) {
     const job = await this.downloadQueue.getJob(id as any);
     if (!job) {
-      const archived = await this.archive.getArchivedJob(id);
+      let archived: any = null;
+      try {
+        archived = await this.archiveRepo.getByJobId(id);
+      } catch (e) {
+        archived = null;
+      }
       if (!archived) return { id, state: 'not-found' };
       return {
         id,
@@ -130,8 +135,12 @@ export class DownloadController {
     let job = await this.downloadQueue.getJob(id as any);
     let data: any = job?.data || null;
     if (!data) {
-      const archived = await this.archive.getArchivedJob(id);
-      data = archived?.masterStatus?.data || null;
+      try {
+        const archived = await this.archiveRepo.getByJobId(id);
+        data = archived?.masterStatus?.data || null;
+      } catch (e) {
+        data = null;
+      }
     }
     if (!data) throw new NotFoundException('job not found');
     const vid = data.vid;
@@ -271,23 +280,7 @@ export class DownloadController {
       // ignore redis errors
     }
 
-    let state = '';
-    try {
-      if (job) state = await job.getState();
-    } catch (e) {
-      state = '';
-    }
-
     try { await this.history.appendEvent(id, { state: 'cancelled', progress: 0 }); } catch (e) { }
-    if (state === 'waiting' || state === 'delayed' || state === 'paused') {
-      try {
-        await this.archive.archiveMasterJob(id, { reason: 'cancel-api', forceTerminalState: 'cancelled' });
-        return { status: 'cancelled', id };
-      } catch (e) {
-        // keep redis data when archive fails
-      }
-    }
-
     if (job) {
       try {
         await job.remove();
@@ -296,13 +289,6 @@ export class DownloadController {
       }
     }
     return { status: 'cancelled', id };
-  }
-
-  @Post('admin/archive/sweep')
-  async adminArchiveSweep(@Body() payload?: { limit?: number; dryRun?: boolean }) {
-    const limit = Math.max(1, Number(payload?.limit || 50));
-    const dryRun = Boolean(payload?.dryRun);
-    return this.archive.sweepTerminalJobs(limit, dryRun, 'admin');
   }
 
   @Post(':id/merge-partial')

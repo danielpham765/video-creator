@@ -43,7 +43,9 @@ export class PostgresService implements OnModuleInit, OnModuleDestroy {
       await this.pool.query('SELECT 1');
       await this.pool.query(`
         CREATE TABLE IF NOT EXISTS download_job_archive (
-          job_id TEXT PRIMARY KEY,
+          archive_key TEXT PRIMARY KEY,
+          run_id TEXT NOT NULL DEFAULT 'legacy',
+          job_id TEXT NOT NULL,
           terminal_state TEXT NOT NULL,
           master_raw JSONB NOT NULL,
           master_status JSONB NOT NULL,
@@ -56,6 +58,9 @@ export class PostgresService implements OnModuleInit, OnModuleDestroy {
           updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
         )
       `);
+      await this.ensureArchiveSchema();
+      await this.pool.query('CREATE UNIQUE INDEX IF NOT EXISTS idx_download_job_archive_archive_key ON download_job_archive (archive_key)');
+      await this.pool.query('CREATE INDEX IF NOT EXISTS idx_download_job_archive_job_id_updated_at ON download_job_archive (job_id, updated_at DESC)');
       await this.pool.query('CREATE INDEX IF NOT EXISTS idx_download_job_archive_state_archived_at ON download_job_archive (terminal_state, archived_at DESC)');
       await this.pool.query('CREATE INDEX IF NOT EXISTS idx_download_job_archive_archived_at ON download_job_archive (archived_at DESC)');
       this.logger.log('Postgres archive table is ready');
@@ -93,5 +98,63 @@ export class PostgresService implements OnModuleInit, OnModuleDestroy {
     if (!this.pool) throw new Error('postgres-unavailable');
     const res = await this.pool.query(sql, params);
     return { rows: res.rows as T[] };
+  }
+
+  private async ensureArchiveSchema(): Promise<void> {
+    if (!this.pool) return;
+    await this.pool.query(`ALTER TABLE download_job_archive ADD COLUMN IF NOT EXISTS archive_key TEXT`);
+    await this.pool.query(`ALTER TABLE download_job_archive ADD COLUMN IF NOT EXISTS run_id TEXT NOT NULL DEFAULT 'legacy'`);
+    await this.pool.query(`ALTER TABLE download_job_archive ALTER COLUMN job_id SET NOT NULL`);
+    await this.pool.query(`
+      UPDATE download_job_archive
+      SET run_id = 'legacy'
+      WHERE run_id IS NULL OR run_id = ''
+    `);
+    await this.pool.query(`
+      UPDATE download_job_archive
+      SET archive_key = 'legacy:' || job_id
+      WHERE archive_key IS NULL OR archive_key = ''
+    `);
+    await this.pool.query(`ALTER TABLE download_job_archive ALTER COLUMN archive_key SET NOT NULL`);
+
+    const { rows: pkRows } = await this.pool.query<{ constraint_name: string; column_name: string }>(
+      `
+      SELECT tc.constraint_name, kcu.column_name
+      FROM information_schema.table_constraints tc
+      JOIN information_schema.key_column_usage kcu
+        ON tc.constraint_name = kcu.constraint_name
+       AND tc.table_schema = kcu.table_schema
+      WHERE tc.table_schema = 'public'
+        AND tc.table_name = 'download_job_archive'
+        AND tc.constraint_type = 'PRIMARY KEY'
+      `,
+    );
+    const pkColumns = new Set((pkRows || []).map((r) => String(r.column_name)));
+    const pkName = pkRows?.[0]?.constraint_name ? String(pkRows[0].constraint_name) : '';
+    if (pkColumns.has('job_id') && pkName) {
+      await this.pool.query(`ALTER TABLE download_job_archive DROP CONSTRAINT ${this.quoteIdent(pkName)}`);
+    }
+
+    const { rows: hasArchivePkRows } = await this.pool.query<{ ok: number }>(
+      `
+      SELECT 1 AS ok
+      FROM information_schema.table_constraints tc
+      JOIN information_schema.key_column_usage kcu
+        ON tc.constraint_name = kcu.constraint_name
+       AND tc.table_schema = kcu.table_schema
+      WHERE tc.table_schema = 'public'
+        AND tc.table_name = 'download_job_archive'
+        AND tc.constraint_type = 'PRIMARY KEY'
+        AND kcu.column_name = 'archive_key'
+      LIMIT 1
+      `,
+    );
+    if (!hasArchivePkRows?.length) {
+      await this.pool.query(`ALTER TABLE download_job_archive ADD CONSTRAINT download_job_archive_pkey PRIMARY KEY (archive_key)`);
+    }
+  }
+
+  private quoteIdent(v: string): string {
+    return `"${String(v).replace(/"/g, '""')}"`;
   }
 }
