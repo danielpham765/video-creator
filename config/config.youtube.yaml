@@ -26,3 +26,4 @@ download:
   # Allowed: 2160p, 1440p, 1080p, 720p, 480p, 360p
   # Fallback goes downward; minimum fallback is 720p unless preferred is 480p or 360p.
   preferVideoQuality: 1080p
+  engine: yt-dlp

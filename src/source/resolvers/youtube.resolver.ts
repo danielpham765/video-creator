@@ -7,6 +7,7 @@ import * as path from 'path';
 import { RuntimeConfigService } from '../../config/runtime-config.service';
 import { ResolveSourceInput, ResolvedSource, SourceResolver } from '../source.types';
 import { buildVideoQualityPolicy } from '../video-quality';
+import { createYtDlpCookieFile, safeUnlink } from '../../utils/yt-dlp-cookies';
 
 @Injectable()
 export class YouTubeResolver implements SourceResolver {
@@ -82,51 +83,79 @@ export class YouTubeResolver implements SourceResolver {
     const formatSelector =
       `bv*[height<=${preferredHeight}][height>=${minAcceptableHeight}]+ba/` +
       `b[height<=${preferredHeight}][height>=${minAcceptableHeight}]/` +
-      `bv*[height<=${preferredHeight}]+ba/b[height<=${preferredHeight}]/b`;
+      `bv*[height<=${preferredHeight}][height>=${minAcceptableHeight}]+ba/` +
+      `b[height<=${preferredHeight}][height>=${minAcceptableHeight}]`;
     const candidates = ['/usr/local/bin/yt-dlp', '/usr/bin/yt-dlp', 'yt-dlp'];
     const extractionErrors: string[] = [];
     const probeFailures: string[] = [];
     let parsed: any = null;
+    const cookieHeader = String(requestHeaders?.Cookie || '').trim();
+    const cookieVariants: Array<{ label: string; cookieHeader: string }> = cookieHeader
+      ? [
+          { label: 'with-cookie', cookieHeader },
+          { label: 'without-cookie', cookieHeader: '' },
+        ]
+      : [{ label: 'no-cookie', cookieHeader: '' }];
     try {
       for (const bin of candidates) {
-        try {
-          const args = ['-J', '--no-playlist', '--no-warnings', '-f', formatSelector];
-          const cookieHeader = String(requestHeaders?.Cookie || '').trim();
-          const userAgentHeader = String(requestHeaders?.['User-Agent'] || '').trim();
-          const refererHeader = String(requestHeaders?.Referer || '').trim();
-          const originHeader = String(requestHeaders?.Origin || '').trim();
-          if (cookieHeader) {
-            args.push('--add-header', `Cookie:${cookieHeader}`);
+        for (const cookieVariant of cookieVariants) {
+          let cookieFilePath: string | null = null;
+          let args: string[] = [];
+          try {
+            args = ['-J', '--no-playlist', '--no-warnings', '-f', formatSelector];
+            const userAgentHeader = String(requestHeaders?.['User-Agent'] || '').trim();
+            const refererHeader = String(requestHeaders?.Referer || '').trim();
+            const originHeader = String(requestHeaders?.Origin || '').trim();
+            if (cookieVariant.cookieHeader) {
+              cookieFilePath = createYtDlpCookieFile({
+                cookieHeader: cookieVariant.cookieHeader,
+                targetUrl: canonicalUrl,
+                outputDir: process.cwd(),
+                filePrefix: `yt-dlp-cookies-${vid}`,
+              });
+              if (cookieFilePath) args.push('--cookies', cookieFilePath);
+            }
+            if (userAgentHeader) {
+              args.push('--add-header', `User-Agent: ${userAgentHeader}`);
+            }
+            if (refererHeader) {
+              args.push('--add-header', `Referer: ${refererHeader}`);
+            }
+            if (originHeader) {
+              args.push('--add-header', `Origin: ${originHeader}`);
+            }
+            args.push(canonicalUrl);
+            this.logger.debug(`youtube yt-dlp command: ${this.renderShellCommand(bin, args)}`);
+            const { stdout } = await this.execFileAsync(
+              bin,
+              args,
+              { timeout: 30000, maxBuffer: 10 * 1024 * 1024 },
+            );
+            parsed = JSON.parse(String(stdout || '{}'));
+            if (!parsed || typeof parsed !== 'object') {
+              extractionErrors.push(`${bin}: invalid JSON payload from yt-dlp (cookieMode=${cookieVariant.label})`);
+              parsed = null;
+              continue;
+            }
+            break;
+          } catch (e: any) {
+            if (String(e?.code || '') === 'ENOENT') {
+              extractionErrors.push(`${bin}: binary not found (ENOENT)`);
+              break;
+            }
+            const cmdText = args.length > 0 ? this.renderShellCommand(bin, args) : `${bin} <args unavailable>`;
+            extractionErrors.push(
+              `${bin}: ${this.summarizeExecFailure(e)} | cookieMode=${cookieVariant.label} | cmd=${cmdText}`,
+            );
+            if (cookieVariant.label === 'with-cookie') {
+              this.logger.warn(`youtube resolver vid=${vid}: yt-dlp failed with cookies, retrying without cookies`);
+            }
+          } finally {
+            safeUnlink(cookieFilePath);
           }
-          if (userAgentHeader) {
-            args.push('--add-header', `User-Agent:${userAgentHeader}`);
-          }
-          if (refererHeader) {
-            args.push('--add-header', `Referer:${refererHeader}`);
-          }
-          if (originHeader) {
-            args.push('--add-header', `Origin:${originHeader}`);
-          }
-          args.push(canonicalUrl);
-          const { stdout } = await this.execFileAsync(
-            bin,
-            args,
-            { timeout: 30000, maxBuffer: 10 * 1024 * 1024 },
-          );
-          parsed = JSON.parse(String(stdout || '{}'));
-          if (!parsed || typeof parsed !== 'object') {
-            extractionErrors.push(`${bin}: invalid JSON payload from yt-dlp`);
-            parsed = null;
-            continue;
-          }
-          break;
-        } catch (e: any) {
-          if (String(e?.code || '') === 'ENOENT') {
-            extractionErrors.push(`${bin}: binary not found (ENOENT)`);
-            continue;
-          }
-          extractionErrors.push(`${bin}: ${this.summarizeExecFailure(e)}`);
+          if (parsed) break;
         }
+        if (parsed) break;
       }
       if (!parsed) {
         return {
@@ -288,10 +317,10 @@ export class YouTubeResolver implements SourceResolver {
   }
 
   private summarizeExecFailure(error: any): string {
-    const message = String(error?.message || error || 'unknown').replace(/\s+/g, ' ').trim();
+    const message = this.redactSensitiveHeaders(String(error?.message || error || 'unknown').replace(/\s+/g, ' ').trim());
     const code = String(error?.code || '').trim();
     const signal = String(error?.signal || '').trim();
-    const stderr = String(error?.stderr || '')
+    const stderr = this.redactSensitiveHeaders(String(error?.stderr || ''))
       .split(/\r?\n/)
       .map((line) => line.trim())
       .filter(Boolean)
@@ -301,7 +330,7 @@ export class YouTubeResolver implements SourceResolver {
     if (code) parts.push(`code=${code}`);
     if (signal) parts.push(`signal=${signal}`);
     if (stderr) parts.push(`stderr=${stderr}`);
-    return parts.join(', ');
+    return this.compactDetail(parts.join(', '), 600);
   }
 
   private summarizeHttpFailure(error: any): string {
@@ -311,7 +340,29 @@ export class YouTubeResolver implements SourceResolver {
     if (status > 0) {
       return `status=${status}${statusText ? ` ${statusText}` : ''}`;
     }
-    return message;
+    return this.compactDetail(message, 240);
+  }
+
+  private redactSensitiveHeaders(raw: string): string {
+    return String(raw || '')
+      .replace(/(--add-header\s+Cookie:)[^\s]+/gi, '$1<redacted>')
+      .replace(/(Cookie:)\s*[^|,\n\r]+/gi, '$1 <redacted>');
+  }
+
+  private compactDetail(raw: string, limit = 600): string {
+    const s = String(raw || '').trim();
+    if (s.length <= limit) return s;
+    return `${s.slice(0, limit - 3)}...`;
+  }
+
+  private renderShellCommand(bin: string, args: string[]): string {
+    return [bin, ...args].map((a) => this.quoteShellArg(a)).join(' ');
+  }
+
+  private quoteShellArg(value: string): string {
+    const s = String(value ?? '');
+    if (/^[A-Za-z0-9_./:@=-]+$/.test(s)) return s;
+    return `'${s.replace(/'/g, `'\"'\"'`)}'`;
   }
 
   private buildRequestHeaders(input: ResolveSourceInput): Record<string, string> {

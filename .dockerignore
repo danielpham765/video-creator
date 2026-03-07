@@ -7,3 +7,8 @@ pnpm-lock.yaml
 .env
 data
 result
+video-result
+logs
+.tmp
+.pnpm-store
+.git

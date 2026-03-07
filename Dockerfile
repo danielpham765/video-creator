@@ -1,4 +1,4 @@
-FROM node:20-bullseye-slim AS base
+FROM node:20-bookworm-slim AS base
 WORKDIR /usr/src/app
 COPY package.json pnpm-lock.yaml* ./
 RUN corepack enable && corepack prepare pnpm@latest --activate
@@ -9,7 +9,7 @@ FROM base AS dev
 COPY . .
 RUN pnpm install --no-frozen-lockfile
 RUN apt-get update && apt-get install -y ffmpeg ca-certificates procps python3-pip \
-  && pip3 install --no-cache-dir yt-dlp \
+  && pip3 install --no-cache-dir --break-system-packages yt-dlp \
   && rm -rf /var/lib/apt/lists/*
 CMD ["pnpm", "run", "start:dev"]
 
@@ -17,6 +17,6 @@ FROM base AS prod
 COPY . .
 RUN pnpm build
 RUN apt-get update && apt-get install -y ffmpeg ca-certificates procps python3-pip \
-  && pip3 install --no-cache-dir yt-dlp \
+  && pip3 install --no-cache-dir --break-system-packages yt-dlp \
   && rm -rf /var/lib/apt/lists/*
 CMD ["node", "dist/main.js"]

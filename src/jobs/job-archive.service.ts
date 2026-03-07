@@ -4,6 +4,7 @@ import { Queue } from 'bull';
 import { RuntimeConfigService } from '../config/runtime-config.service';
 import { JobArchiveRepository } from './job-archive.repository';
 import { JobHistoryService } from './job-history.service';
+import { formatElapsedDuration } from '../utils/duration-format';
 
 const MASTER_STATE_KEYS = ['completed', 'failed', 'wait', 'active', 'paused', 'delayed'] as const;
 const PART_STATE_KEYS = ['completed', 'failed', 'wait', 'active', 'paused', 'delayed'] as const;
@@ -145,6 +146,10 @@ export class JobArchiveService implements OnModuleInit, OnModuleDestroy {
         terminalState = this.inferTerminalStateFromArtifacts(history, partJobsRaw);
       }
       if (!terminalState) return { archived: false, skippedReason: 'not-terminal' };
+      if (!opts?.forceTerminalState) {
+        const coolingDown = await this.isInTerminalCooldown(jobId, terminalState, masterJob, masterRaw || {}, redisClient);
+        if (coolingDown) return { archived: false, skippedReason: 'terminal-cooldown' };
+      }
 
       const masterStatus = this.buildMasterStatus(jobId, masterJob, masterRaw || {}, history, terminalState);
       const partJobsSummary = this.summarizePartJobs(partJobsRaw);
@@ -175,7 +180,11 @@ export class JobArchiveService implements OnModuleInit, OnModuleDestroy {
       if (opts?.dryRun) return { archived: true };
 
       await this.cleanupRedisArtifacts(jobId, masterJob, partJobsRaw, redisClient);
-      this.logger.log(`Archived master job ${jobId} (${terminalState}) reason=${opts?.reason || 'n/a'}`);
+      const archivedElapsed = this.formatArchiveAge(masterJob, masterRaw || {});
+      this.logger.log(
+        `Archived master job ${jobId} (${terminalState}) reason=${opts?.reason || 'n/a'}` +
+        `${archivedElapsed ? ` elapsed=${archivedElapsed}` : ''}`,
+      );
       return { archived: true };
     } finally {
       await this.releaseRedisLock(redisClient, lockKey, lockToken);
@@ -201,6 +210,80 @@ export class JobArchiveService implements OnModuleInit, OnModuleDestroy {
   private getSweepLockMs(): number {
     const n = Number(this.runtimeConfig.getGlobal('archive.sweepLockMs') ?? 55000);
     return Number.isFinite(n) && n >= 1000 ? Math.floor(n) : 55000;
+  }
+
+  private getArchiveDelayMs(): number {
+    const n = Number(this.runtimeConfig.getGlobal('archive.delayMs') ?? 30000);
+    return Number.isFinite(n) && n >= 0 ? Math.floor(n) : 30000;
+  }
+
+  private formatArchiveAge(masterJob: any, masterRaw: Record<string, any>): string | null {
+    const candidates = [
+      masterJob?.timestamp,
+      masterRaw?.timestamp,
+      masterJob?.processedOn,
+      masterRaw?.processedOn,
+    ];
+    for (const c of candidates) {
+      const ts = Number(c || 0);
+      if (!Number.isFinite(ts) || ts <= 0) continue;
+      return formatElapsedDuration(Math.max(0, Date.now() - ts));
+    }
+    return null;
+  }
+
+  private normalizeEpochMs(v: any): number | null {
+    const n = Number(v || 0);
+    if (!Number.isFinite(n) || n <= 0) return null;
+    // Some sources may return seconds; convert to ms.
+    return n < 1_000_000_000_000 ? Math.floor(n * 1000) : Math.floor(n);
+  }
+
+  private async resolveTerminalAtMs(
+    jobId: string,
+    state: 'finished' | 'failed' | 'cancelled',
+    masterJob: any,
+    masterRaw: Record<string, any>,
+    redisClient: any,
+  ): Promise<number | null> {
+    const directCandidates = [
+      masterJob?.finishedOn,
+      masterRaw?.finishedOn,
+      masterJob?.processedOn,
+      masterRaw?.processedOn,
+      masterJob?.timestamp,
+      masterRaw?.timestamp,
+    ];
+    for (const c of directCandidates) {
+      const ms = this.normalizeEpochMs(c);
+      if (ms) return ms;
+    }
+
+    try {
+      if (!redisClient || typeof redisClient.zscore !== 'function') return null;
+      const key = state === 'failed' ? 'bull:downloads:failed' : 'bull:downloads:completed';
+      const score = await redisClient.zscore(key, jobId);
+      const ms = this.normalizeEpochMs(score);
+      if (ms) return ms;
+    } catch {}
+
+    return null;
+  }
+
+  private async isInTerminalCooldown(
+    jobId: string,
+    state: 'finished' | 'failed' | 'cancelled',
+    masterJob: any,
+    masterRaw: Record<string, any>,
+    redisClient: any,
+  ): Promise<boolean> {
+    const delayMs = this.getArchiveDelayMs();
+    if (delayMs <= 0) return false;
+    const terminalAtMs = await this.resolveTerminalAtMs(jobId, state, masterJob, masterRaw, redisClient);
+    if (!terminalAtMs) return false;
+    const ageMs = Math.max(0, Date.now() - terminalAtMs);
+    if (ageMs >= delayMs) return false;
+    return true;
   }
 
   private async initializeRunId(): Promise<void> {

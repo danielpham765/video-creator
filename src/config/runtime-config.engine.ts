@@ -405,15 +405,14 @@ export class RuntimeConfigEngine {
     if (raw.startsWith('[')) {
       const arr = JSON.parse(raw);
       if (!Array.isArray(arr)) throw new Error(`invalid cookie array in ${filePath}`);
-      return arr
+      const pairs = arr
         .map((item: any) => {
           const name = String(item?.name || '').trim();
           const value = String(item?.value || '').trim();
-          if (!name) return '';
-          return `${name}=${value}`;
+          return { name, value };
         })
-        .filter(Boolean)
-        .join('; ');
+        .filter((x: { name: string; value: string }) => x.name.length > 0);
+      return this.serializeCookiePairs(pairs);
     }
 
     if (raw.startsWith('{')) {
@@ -421,13 +420,73 @@ export class RuntimeConfigEngine {
       if (!obj || typeof obj !== 'object' || Array.isArray(obj)) {
         throw new Error(`invalid cookie object in ${filePath}`);
       }
-      return Object.entries(obj)
-        .map(([k, v]) => `${String(k).trim()}=${String(v ?? '').trim()}`)
-        .filter((s) => !s.startsWith('='))
-        .join('; ');
+      const pairs = Object.entries(obj).map(([k, v]) => ({
+        name: String(k).trim(),
+        value: String(v ?? '').trim(),
+      }));
+      return this.serializeCookiePairs(pairs);
     }
 
-    return raw;
+    if (this.isLikelyNetscapeCookieFile(raw)) {
+      const lines = raw.split(/\r?\n/);
+      const pairs = lines
+        .map((line) => this.parseNetscapeCookieLine(line))
+        .filter((x): x is { name: string; value: string } => !!x);
+      return this.serializeCookiePairs(pairs);
+    }
+
+    const pairs = raw
+      .replace(/\r/g, ' ')
+      .replace(/\n/g, ' ')
+      .split(';')
+      .map((part) => String(part || '').trim())
+      .filter(Boolean)
+      .map((part) => {
+        const eq = part.indexOf('=');
+        if (eq <= 0) return null;
+        return {
+          name: part.slice(0, eq).trim(),
+          value: part.slice(eq + 1).trim(),
+        };
+      })
+      .filter((x): x is { name: string; value: string } => !!x);
+    return this.serializeCookiePairs(pairs);
+  }
+
+  private isLikelyNetscapeCookieFile(raw: string): boolean {
+    const txt = String(raw || '').trim();
+    if (!txt) return false;
+    if (txt.startsWith('# Netscape HTTP Cookie File')) return true;
+    const lines = txt.split(/\r?\n/).map((x) => x.trim()).filter(Boolean);
+    return lines.some((line) => !line.startsWith('#') && line.split('\t').length >= 7);
+  }
+
+  private parseNetscapeCookieLine(lineRaw: string): { name: string; value: string } | null {
+    const line = String(lineRaw || '').trim();
+    if (!line || line.startsWith('#')) return null;
+    const cols = String(lineRaw || '').split('\t');
+    if (cols.length < 7) return null;
+    const name = String(cols[5] || '').trim();
+    const value = String(cols.slice(6).join('\t') || '').trim();
+    if (!name) return null;
+    return { name, value };
+  }
+
+  private serializeCookiePairs(pairs: Array<{ name: string; value: string }>): string {
+    return pairs
+      .map((pair) => {
+        const name = String(pair?.name || '').trim();
+        const value = String(pair?.value || '')
+          .replace(/[\t\r\n]/g, ' ')
+          .replace(/[\u0000-\u001f\u007f]/g, '')
+          .trim();
+        if (!name) return '';
+        if (!/^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$/.test(name)) return '';
+        if (/[^\x20-\x7E]/.test(value)) return '';
+        return `${name}=${value}`;
+      })
+      .filter(Boolean)
+      .join('; ');
   }
 
   private statFile(filePath: string): { mtimeMs: number; size: number } {

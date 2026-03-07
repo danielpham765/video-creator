@@ -5,6 +5,7 @@ import { promisify } from 'util';
 import { BilibiliResolver } from './bilibili.resolver';
 import { YouTubeResolver } from './youtube.resolver';
 import { ResolveSourceInput, ResolvedSource, SourceResolver } from '../source.types';
+import { createYtDlpCookieFile, safeUnlink } from '../../utils/yt-dlp-cookies';
 
 @Injectable()
 export class GenericResolver implements SourceResolver {
@@ -78,10 +79,19 @@ export class GenericResolver implements SourceResolver {
   private async resolveViaYtDlp(url: string, title?: string, cookies?: string): Promise<ResolvedSource | null> {
     const candidates = ['/usr/local/bin/yt-dlp', '/usr/bin/yt-dlp', 'yt-dlp'];
     for (const bin of candidates) {
+      let cookieFilePath: string | null = null;
       try {
         const args = ['-J', '--no-playlist', '--no-warnings'];
         const cookieHeader = String(cookies || '').trim();
-        if (cookieHeader) args.push('--add-header', `Cookie:${cookieHeader}`);
+        if (cookieHeader) {
+          cookieFilePath = createYtDlpCookieFile({
+            cookieHeader,
+            targetUrl: url,
+            outputDir: process.cwd(),
+            filePrefix: 'yt-dlp-cookies-generic',
+          });
+          if (cookieFilePath) args.push('--cookies', cookieFilePath);
+        }
         args.push(url);
 
         const { stdout } = await this.execFileAsync(bin, args, {
@@ -132,6 +142,8 @@ export class GenericResolver implements SourceResolver {
       } catch (e: any) {
         if (String(e?.code || '') === 'ENOENT') continue;
         return null;
+      } finally {
+        safeUnlink(cookieFilePath);
       }
     }
     return null;

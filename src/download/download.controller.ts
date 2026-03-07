@@ -54,8 +54,8 @@ export class DownloadController {
         : 'auto';
     const payloadEngineRaw = String((payload as any).engine || '').toLowerCase();
     const engine: 'auto' | 'yt-dlp' | 'native' =
-      payloadEngineRaw === 'yt-dlp' || payloadEngineRaw === 'native' || payloadEngineRaw === 'auto'
-        ? (payloadEngineRaw as 'auto' | 'yt-dlp' | 'native')
+      payloadEngineRaw === 'yt-dlp' || payloadEngineRaw === 'native'
+        ? (payloadEngineRaw as 'yt-dlp' | 'native')
         : configuredEngine;
     const jobPayload: any = {
       platform: identity.platform,

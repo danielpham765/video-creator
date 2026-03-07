@@ -96,8 +96,17 @@ export class PartsProcessor {
     const permit = await this.acquirePartSlot(job);
     const partStartedAt = Date.now();
     try {
-      const data = job.data;
-      const { jobId, vid, totalJobCount, url, partIndex, rangeStart, rangeEnd, segmentUrls, expectedBytes, headers, role } = data as any;
+      const data = (job.data || {}) as any;
+      const normalized = this.normalizePartJobData(data);
+      if (normalized.ok === false) {
+        this.logger.warn(
+          `Skipping invalid part job queueJobId=${job.id}: ${normalized.reason}. payload=${this.compactJson(data)}`,
+        );
+        try { job.discard(); } catch {}
+        await job.progress(100).catch(() => undefined);
+        return { skipped: true, reason: normalized.reason };
+      }
+      const { jobId, vid, totalJobCount, url, partIndex, rangeStart, rangeEnd, segmentUrls, expectedBytes, headers, role } = normalized;
       const rawPlatform = String((data as any)?.platform || 'generic').toLowerCase();
       const platform: ConcretePlatform = rawPlatform === 'bilibili' || rawPlatform === 'youtube' || rawPlatform === 'generic'
         ? (rawPlatform as ConcretePlatform)
@@ -169,7 +178,10 @@ export class PartsProcessor {
           if (fs.existsSync(partPath)) {
             const existingSize = fs.statSync(partPath).size;
             if (this.isCompletePartSize(existingSize, expectedBytes)) {
-              this.logger.log(`Job ${jobId} part ${partIndex}/${displayTotalJobCount}: reusing existing part (${formatMb(existingSize)} MB) in ${formatElapsedDuration(Date.now() - partStartedAt)}`);
+              this.logger.log(
+                `Job ${jobId} part ${partIndex}/${displayTotalJobCount}: reusing existing part (${formatMb(existingSize)} MB) ` +
+                `elapsed=${formatElapsedDuration(Date.now() - partStartedAt)}`,
+              );
               const redisClient: any = (this.partsQueue && (this.partsQueue as any).client) ? (this.partsQueue as any).client : null;
               if (redisClient) {
                 try {
@@ -267,7 +279,10 @@ export class PartsProcessor {
               await redisClient.hset(key, `${fieldPrefix}:expectedBytes`, String(expectedBytes));
             } catch (e) {}
           }
-          this.logger.log(`Job ${jobId} part ${partIndex}/${displayTotalJobCount} completed (${formatMbProgress(finalSize, expectedBytes)}) in ${formatElapsedDuration(Date.now() - partStartedAt)}`);
+          this.logger.log(
+            `Job ${jobId} part ${partIndex}/${displayTotalJobCount} completed ` +
+            `(${formatMbProgress(finalSize, expectedBytes)}) elapsed=${formatElapsedDuration(Date.now() - partStartedAt)}`,
+          );
           this.logger.debug(`Part ${partIndex} wrote ${formatMb(finalSize)} MB to ${partPath}`);
           return { jobId, vid, partIndex, path: partPath, bytes: finalSize, expectedBytes };
         }
@@ -320,7 +335,10 @@ export class PartsProcessor {
           }
         }
 
-        this.logger.log(`Job ${jobId} part ${partIndex}/${displayTotalJobCount} completed (${formatMbProgress(finalSize, expectedBytes)}) in ${formatElapsedDuration(Date.now() - partStartedAt)}`);
+        this.logger.log(
+          `Job ${jobId} part ${partIndex}/${displayTotalJobCount} completed ` +
+          `(${formatMbProgress(finalSize, expectedBytes)}) elapsed=${formatElapsedDuration(Date.now() - partStartedAt)}`,
+        );
         this.logger.debug(`Part ${partIndex} final size=${finalSize} md5=${result.md5 || 'n/a'}`);
 
         return {
@@ -561,5 +579,87 @@ export class PartsProcessor {
       leaseMs: Math.max(5000, Number(this.runtimeConfig.getGlobal('download.globalLimiterLeaseMs') ?? process.env.GLOBAL_LIMITER_LEASE_MS ?? 120000)),
       waitMs: Math.max(100, Number(this.runtimeConfig.getGlobal('download.globalLimiterWaitMs') ?? process.env.GLOBAL_LIMITER_WAIT_MS ?? 300)),
     };
+  }
+
+  private normalizePartJobData(data: any): (
+    | {
+        ok: true;
+        jobId: string;
+        vid: string;
+        totalJobCount: number;
+        url?: string;
+        partIndex: number;
+        rangeStart?: number;
+        rangeEnd?: number;
+        segmentUrls?: string[];
+        expectedBytes: number;
+        headers?: Record<string, string>;
+        role: 'video' | 'audio';
+      }
+    | { ok: false; reason: string }
+  ) {
+    const jobId = String(data?.jobId ?? '').trim();
+    if (!jobId) return { ok: false, reason: 'missing jobId' };
+
+    const partIndexNum = Number(data?.partIndex);
+    if (!Number.isFinite(partIndexNum) || partIndexNum < 0) return { ok: false, reason: 'invalid partIndex' };
+    const partIndex = Math.floor(partIndexNum);
+
+    const role: 'video' | 'audio' = data?.role === 'audio' ? 'audio' : 'video';
+    const vid = String(data?.vid || '').trim();
+    const totalJobCount = Number.isFinite(Number(data?.totalJobCount))
+      ? Math.max(0, Math.floor(Number(data?.totalJobCount)))
+      : 0;
+    const expectedBytes = Number.isFinite(Number(data?.expectedBytes))
+      ? Math.max(0, Math.floor(Number(data?.expectedBytes)))
+      : 0;
+    const headers = data?.headers && typeof data.headers === 'object'
+      ? (data.headers as Record<string, string>)
+      : undefined;
+
+    const segmentUrls = Array.isArray(data?.segmentUrls)
+      ? data.segmentUrls.map((x: any) => String(x || '').trim()).filter(Boolean)
+      : [];
+    if (segmentUrls.length > 0) {
+      return { ok: true, jobId, vid, totalJobCount, partIndex, segmentUrls, expectedBytes, headers, role };
+    }
+
+    const url = String(data?.url || '').trim();
+    if (!url) return { ok: false, reason: 'missing url/segmentUrls' };
+    const rangeStartNum = Number(data?.rangeStart);
+    const rangeEndNum = Number(data?.rangeEnd);
+    if (
+      !Number.isFinite(rangeStartNum)
+      || !Number.isFinite(rangeEndNum)
+      || rangeStartNum < 0
+      || rangeEndNum < rangeStartNum
+    ) {
+      return { ok: false, reason: 'invalid byte-range' };
+    }
+    return {
+      ok: true,
+      jobId,
+      vid,
+      totalJobCount,
+      url,
+      partIndex,
+      rangeStart: Math.floor(rangeStartNum),
+      rangeEnd: Math.floor(rangeEndNum),
+      expectedBytes,
+      headers,
+      role,
+    };
+  }
+
+  private compactJson(value: any, maxLen = 320): string {
+    let text = '';
+    try {
+      text = JSON.stringify(value);
+    } catch {
+      text = String(value);
+    }
+    const clean = String(text || '').replace(/\s+/g, ' ').trim();
+    if (clean.length <= maxLen) return clean;
+    return `${clean.slice(0, maxLen - 3)}...`;
   }
 }
