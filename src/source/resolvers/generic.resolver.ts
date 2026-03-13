@@ -29,20 +29,26 @@ export class GenericResolver implements SourceResolver {
       return this.buildDirectMediaSource(url, input.title);
     }
 
-    const resp = await axios.get(url, {
-      timeout: 8000,
-      responseType: 'text',
-      maxContentLength: 1024 * 1024,
-      maxBodyLength: 1024 * 1024,
-      validateStatus: (s) => s >= 200 && s < 400,
-    });
+    let html = '';
+    let fetchFailure: string | null = null;
+    try {
+      const resp = await axios.get(url, {
+        timeout: 8000,
+        responseType: 'text',
+        maxContentLength: 1024 * 1024,
+        maxBodyLength: 1024 * 1024,
+        validateStatus: (s) => s >= 200 && s < 400,
+      });
 
-    const contentType = String(resp.headers?.['content-type'] || '').toLowerCase();
-    if (contentType.startsWith('video/') || contentType.startsWith('audio/')) {
-      return this.buildDirectMediaSource(url, input.title, contentType);
+      const contentType = String(resp.headers?.['content-type'] || '').toLowerCase();
+      if (contentType.startsWith('video/') || contentType.startsWith('audio/')) {
+        return this.buildDirectMediaSource(url, input.title, contentType);
+      }
+
+      html = String(resp.data || '');
+    } catch (e: any) {
+      fetchFailure = this.summarizeFetchFailure(e);
     }
-
-    const html = String(resp.data || '');
 
     const embeddedYoutube = this.matchFirst(html, [
       /https?:\/\/(?:www\.)?youtube\.com\/watch\?v=[A-Za-z0-9_-]{6,}/i,
@@ -59,8 +65,24 @@ export class GenericResolver implements SourceResolver {
       return this.bilibiliResolver.resolve({ ...input, url: embeddedBilibili, platform: 'bilibili' });
     }
 
+    const douyinMediaUrl = this.extractDouyinMediaUrl(html);
+    if (douyinMediaUrl) {
+      return this.buildDirectMediaSource(
+        douyinMediaUrl,
+        input.title,
+        undefined,
+        this.buildDouyinHeaders(url),
+      );
+    }
+
     const viaYtDlp = await this.resolveViaYtDlp(url, input.title, input.cookies);
     if (viaYtDlp) return viaYtDlp;
+
+    if (fetchFailure) {
+      throw new Error(
+        `unsupported source: failed to fetch page metadata (${fetchFailure}); yt-dlp also could not resolve media streams`,
+      );
+    }
 
     const mediaSrc = this.matchFirst(html, [
       /<meta[^>]+property=["']og:video["'][^>]+content=["']([^"']+)["']/i,
@@ -161,7 +183,12 @@ export class GenericResolver implements SourceResolver {
     return out;
   }
 
-  private buildDirectMediaSource(url: string, title?: string, contentType?: string): ResolvedSource {
+  private buildDirectMediaSource(
+    url: string,
+    title?: string,
+    contentType?: string,
+    headers: Record<string, string> = {},
+  ): ResolvedSource {
     const ext = this.fileExt(url, contentType);
     const isAudio = ['m4a', 'mp3', 'aac', 'ogg', 'wav'].includes(ext);
     const isVideo = ['mp4', 'webm', 'mkv', 'mov', 'm3u8'].includes(ext);
@@ -170,7 +197,7 @@ export class GenericResolver implements SourceResolver {
       vid: this.fingerprint(url),
       canonicalUrl: url,
       title: title || this.defaultTitle(url),
-      headers: {},
+      headers,
     };
 
     if (isAudio) {
@@ -237,5 +264,46 @@ export class GenericResolver implements SourceResolver {
       if (value) return value;
     }
     return null;
+  }
+
+  private extractDouyinMediaUrl(html: string): string | null {
+    const normalized = String(html || '')
+      .replace(/\\u002F/gi, '/')
+      .replace(/\\u0026/gi, '&')
+      .replace(/\\\//g, '/')
+      .replace(/&amp;/gi, '&');
+    const patterns = [
+      /https?:\/\/www\.douyin\.com\/aweme\/v1\/play\/\?[^"'\\\s<]+/i,
+      /https?:\/\/aweme\.snssdk\.com\/aweme\/v1\/play\/\?[^"'\\\s<]+/i,
+      /https?:\/\/v\d+-web-[^\/\s"'\\]+\.douyinvod\.com\/video\/[^"'\\\s<]+/i,
+      /https?:\/\/v\d+-web\.[^\/\s"'\\]+\.douyinvod\.com\/video\/[^"'\\\s<]+/i,
+    ];
+    for (const pattern of patterns) {
+      const m = normalized.match(pattern);
+      if (!m?.[0]) continue;
+      return m[0];
+    }
+    return null;
+  }
+
+  private buildDouyinHeaders(pageUrl: string): Record<string, string> {
+    try {
+      const u = new URL(pageUrl);
+      return {
+        Referer: `${u.protocol}//${u.host}/`,
+        Origin: `${u.protocol}//${u.host}`,
+      };
+    } catch {
+      return {};
+    }
+  }
+
+  private summarizeFetchFailure(error: any): string {
+    const message = String(error?.message || 'unknown error').trim();
+    const code = String(error?.code || '').trim();
+    const status = Number(error?.response?.status || 0);
+    if (status > 0) return `${status}${message ? ` ${message}` : ''}`;
+    if (code) return `${code}${message ? ` ${message}` : ''}`;
+    return message || 'unknown error';
   }
 }

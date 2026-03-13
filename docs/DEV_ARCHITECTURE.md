@@ -1,10 +1,10 @@
 ## Video Downloader API - Developer Architecture
 
-Last updated: 2026-03-04
+Last updated: 2026-03-08
 
 ### High-level overview
 
-- Purpose: background-friendly multi-source downloader. API receives download requests, worker resolves playable URLs via platform handlers, downloads, merges/transcodes, and stores final files in `result/`.
+- Purpose: background-friendly multi-source downloader. API receives download requests, worker resolves playable URLs via platform handlers, downloads, merges/transcodes, and stores final files in `video-result/`.
 - Stack: NestJS + Bull + Redis + Postgres + FFmpeg.
 - Persistence:
   - Bull/Redis for in-flight queue state.
@@ -98,7 +98,7 @@ Last updated: 2026-03-04
   - Vietnamese/Latin: remove accents, lowercase, spaces -> `-`, trim duplicates.
   - Chinese/CJK: keep original (sanitized for path-invalid chars).
 - Final path:
-  - `result/<platform>/<normalizedTitle>/<vid>-<jobId>.<ext>`
+  - `video-result/<platform>/<normalizedTitle>/<vid>-<jobId>.<ext>`
 
 ### Strategy selection (current order)
 
@@ -277,10 +277,11 @@ Logger: `FileLoggerService` (used as Nest logger in `main.ts`).
 ### Filesystem layout
 
 - `data/`
-  - `bilibili/<safeTitle>/<bvid>-<jobId>.mp4`
   - `<jobId>/manifest.json`
   - `<jobId>/parts/part-<i>.bin`, `audio-part-<i>.bin`
   - `jobs/<jobId>.json`
+- `video-result/`
+  - `<platform>/<normalizedTitle>/<vid>-<jobId>.<ext>`
 - `logs/`
   - `api/app.*.log`
   - `worker/<worker-label>/app.*.log`

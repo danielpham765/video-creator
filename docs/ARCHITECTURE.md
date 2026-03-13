@@ -1,12 +1,12 @@
 ## Video Creator API Architecture (AI Cache)
 
-Last updated: 2026-03-04
+Last updated: 2026-03-08
 Source of truth for Cursor, Codex, and Antigravity AI.
 
 ### 1) Purpose
 
 - Project: `video-creator` (NestJS + Bull + Redis + Postgres + FFmpeg).
-- Goal: accept multi-platform video/page URLs (Bilibili, YouTube, generic), run background downloads, and write final media files under `result/`.
+- Goal: accept multi-platform video/page URLs (Bilibili, YouTube, generic), run background downloads, and write final media files under `video-result/`.
 - Persistence:
   - In-flight queue/runtime state in Bull + Redis.
   - Terminal master-job archive in Postgres table `download_job_archive` (append-safe with `archive_key = <run_id>:<job_id>`).
@@ -45,7 +45,7 @@ Source of truth for Cursor, Codex, and Antigravity AI.
    - `dash-single`
    - `durl` (single file)
 5. Parts (if any) are merged, then video/audio merged by [`FfmpegService`](/Users/danielpham/sync-workspace/05_Stories/video-creator/src/ffmpeg/ffmpeg.service.ts).
-6. Final output: `result/<platform>/<safeTitle>/<vid>-<jobId>.<ext>` where `<ext>` is `.mp4` or `.m4a`.
+6. Final output: `video-result/<platform>/<safeTitle>/<vid>-<jobId>.<ext>` where `<ext>` is `.mp4` or `.m4a`.
 7. History events are appended to `data/jobs/<jobId>.json`.
 
 ### 5) Public API (Current)
@@ -92,8 +92,9 @@ Source of truth for Cursor, Codex, and Antigravity AI.
 
 ### 8) Filesystem Layout
 
-- `result/`
+- `video-result/`
   - `<platform>/<safeTitle>/<vid>-<jobId>.<ext>`
+- `data/`
   - `<jobId>/manifest.json`
   - `<jobId>/parts/part-<i>.bin`, `audio-part-<i>.bin`
   - `jobs/<jobId>.json`

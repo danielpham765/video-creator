@@ -6,6 +6,7 @@ Purpose
 
 Files
 - `map_sockets.js` — OS/container diagnostic that parses `/proc/net/tcp` and attempts to map socket inodes to resolved hosts (Linux-only).
+- `enqueue-smoke.js` — enqueues a simple smoke-test master job into the `downloads` queue.
 - Note: the following scripts were moved to `test/manual/` because they are manual test helpers:
   - `test/manual/enqueue_test_parts.js`
   - `test/manual/playurl_test_worker.js`
@@ -14,7 +15,7 @@ Files
 Prerequisites
 - Node.js (v14+ recommended)
 - Network access to external URLs used by the scripts
-- `config/cookies.json` present and formatted as an array of `{ name, value }` objects for Bilibili-related scripts
+- `config/cookies/bilibili.json` present and formatted as an array of `{ name, value }` objects for Bilibili-related scripts
 - Redis is required to run `enqueue_test_parts.js` (it was moved to `test/manual`)
 - `map_sockets.js` requires access to `/proc` (Linux/container). It will not function on macOS directly.
 
@@ -23,6 +24,12 @@ Usage examples
 
 ```bash
 node scripts/map_sockets.js [BV_ID]
+```
+
+- Enqueue a simple smoke job:
+
+```bash
+node scripts/enqueue-smoke.js [VIDEO_URL]
 ```
 
 - For manual test helpers see `test/manual` (examples below).
